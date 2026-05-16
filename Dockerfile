@@ -4,10 +4,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg gcc libp
 
 WORKDIR /app
 
-COPY transcode_service/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY transcode_service/ ./transcode_service/
+# Copy into transcode_service/ so "from transcode_service.x import y" imports work
+COPY . ./transcode_service/
 
 EXPOSE 8001
 

@@ -65,26 +65,25 @@ async def _transcode(source: Path, out_dir: Path) -> None:
     # Build filter_complex + output map for each rendition
     filter_parts: list[str] = []
     output_args: list[str] = []
-    for i, (label, scale) in enumerate(settings.renditions.items()):
-        filter_parts.append(f"[v{i}]")
+    variant_streams: list[str] = []
+    rendition_items = list(settings.renditions.items())
+    for i, (label, _scale) in enumerate(rendition_items):
+        filter_parts.append(f"[split{i}]")
         output_args += [
-            f"-map", f"[v{i}]",
+            f"-map", f"[out{i}]",
             f"-map", "a:0",
             f"-c:v:{i}", "libx264",
             f"-preset", "fast",
             f"-crf", "23",
             f"-c:a:{i}", "aac",
             f"-b:a:{i}", "128k",
-            f"-var_stream_map", f"v:{i},a:{i}",
-            f"-hls_time", str(settings.hls_segment_time),
-            f"-hls_playlist_type", "vod",
-            f"-hls_segment_filename", str(out_dir / f"{label}_%03d.ts"),
         ]
+        variant_streams.append(f"v:{i},a:{i},name:{label}")
 
-    splits = "".join(f"[v{i}]" for i in range(len(settings.renditions)))
-    filter_complex = f"[0:v]split={len(settings.renditions)}{splits};" + ";".join(
-        f"[v{i}]scale={scale}[v{i}]"
-        for i, scale in enumerate(settings.renditions.values())
+    splits = "".join(filter_parts)
+    filter_complex = f"[0:v]split={len(rendition_items)}{splits};" + ";".join(
+        f"[split{i}]scale={scale}[out{i}]"
+        for i, (_label, scale) in enumerate(rendition_items)
     )
 
     cmd = [
@@ -92,6 +91,10 @@ async def _transcode(source: Path, out_dir: Path) -> None:
         "-i", str(source),
         "-filter_complex", filter_complex,
         *output_args,
+        "-var_stream_map", " ".join(variant_streams),
+        "-hls_time", str(settings.hls_segment_time),
+        "-hls_playlist_type", "vod",
+        "-hls_segment_filename", str(out_dir / "%v_%03d.ts"),
         str(out_dir / "%v.m3u8"),
     ]
 
@@ -106,7 +109,6 @@ async def _transcode(source: Path, out_dir: Path) -> None:
 
     # Write master playlist
     master_lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
-    rendition_items = list(settings.renditions.items())
     for i, (label, scale) in enumerate(rendition_items):
         w, h = scale.split(":")
         master_lines.append(
@@ -218,7 +220,12 @@ async def run_worker() -> None:
     global pool
     # asyncpg uses the raw postgresql:// URL (strip the +asyncpg driver prefix)
     dsn = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
-    pool = await asyncpg.create_pool(dsn, min_size=2, max_size=settings.max_concurrent + 1)
+    pool = await asyncpg.create_pool(
+        dsn,
+        min_size=2,
+        max_size=settings.max_concurrent + 1,
+        statement_cache_size=0,
+    )
     semaphore = asyncio.Semaphore(settings.max_concurrent)
 
     print("[transcode] worker started")
