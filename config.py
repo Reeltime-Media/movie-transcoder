@@ -7,6 +7,10 @@ class Settings(BaseSettings):
     # App
     app_name: str = "Transcode Service"
     api_key: str = ""  # If set, required as X-Api-Key header on all job endpoints
+    debug: bool = False
+    secret_key: str = ""
+    algorithm: str = "HS256"
+    access_token_expire_minutes: int = 1440
 
     # Direct asyncpg connection (no pooler) for long-running worker
     database_url: str  # postgresql+asyncpg://...
