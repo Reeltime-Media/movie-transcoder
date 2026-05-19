@@ -72,9 +72,8 @@ async def _transcode(source: Path, out_dir: Path) -> None:
         output_args += [
             f"-map", f"[out{i}]",
             f"-map", "a:0",
-            f"-c:v:{i}", "libx264",
-            f"-preset", "fast",
-            f"-crf", "23",
+            f"-c:v:{i}", "h264_videotoolbox",
+            f"-b:v:{i}", _bitrate(label),
             f"-c:a:{i}", "aac",
             f"-b:a:{i}", "128k",
         ]
@@ -88,6 +87,7 @@ async def _transcode(source: Path, out_dir: Path) -> None:
 
     cmd = [
         settings.ffmpeg_path,
+        "-threads", "0",
         "-i", str(source),
         "-filter_complex", filter_complex,
         *output_args,
@@ -121,6 +121,10 @@ async def _transcode(source: Path, out_dir: Path) -> None:
 
 def _bandwidth(label: str) -> int:
     return {"1080p": 5_000_000, "720p": 3_000_000, "480p": 1_500_000, "360p": 800_000}.get(label, 2_000_000)
+
+
+def _bitrate(label: str) -> str:
+    return {"1080p": "5000k", "720p": "3000k", "480p": "1500k", "360p": "800k"}.get(label, "2000k")
 
 
 # ── DB helpers (asyncpg direct) ───────────────────────────────────────────────
