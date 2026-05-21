@@ -59,6 +59,12 @@ async def list_jobs(job_status: str | None = None):
     return [dict(r) for r in rows]
 
 
+@router.get("/progress", dependencies=[Depends(_require_api_key)])
+async def get_all_progress():
+    """Return progress for all currently-running jobs in one call."""
+    return worker_module.job_progress
+
+
 @router.get("/{job_id}", response_model=JobRead, dependencies=[Depends(_require_api_key)])
 async def get_job(job_id: uuid.UUID):
     """Get a single transcode job by ID."""
@@ -69,6 +75,38 @@ async def get_job(job_id: uuid.UUID):
     if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
     return dict(row)
+
+
+@router.get("/{job_id}/progress", dependencies=[Depends(_require_api_key)])
+async def get_job_progress(job_id: uuid.UUID):
+    """Return the live encoding progress (0-100) for a running job."""
+    return {"job_id": str(job_id), "progress": worker_module.job_progress.get(str(job_id), 0)}
+
+
+@router.post("/{job_id}/cancel", dependencies=[Depends(_require_api_key)])
+async def cancel_job(job_id: uuid.UUID):
+    """Kill the ffmpeg process for a running job, or force-cancel a stuck DB record."""
+    # Try to kill a live ffmpeg process first
+    if worker_module.cancel_job(str(job_id)):
+        return {"job_id": str(job_id), "cancelled": True}
+
+    # No live process — job may be stuck as "running" from a previous worker restart
+    pool = _pool()
+    row = await pool.fetchrow("SELECT status FROM transcode_jobs WHERE id = $1", job_id)
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if row["status"] != "running":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job is not running (status: {row['status']})",
+        )
+    await pool.execute(
+        """UPDATE transcode_jobs
+           SET status = 'failed', finished_at = now(), error = 'Cancelled by admin'
+           WHERE id = $1""",
+        job_id,
+    )
+    return {"job_id": str(job_id), "cancelled": True}
 
 
 @router.post("/{job_id}/retry", response_model=JobRead, dependencies=[Depends(_require_api_key)])

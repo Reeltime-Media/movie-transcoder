@@ -10,7 +10,9 @@ Flow per job:
 """
 
 import asyncio
+import json
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -56,11 +58,49 @@ def _upload_dir(local_dir: Path, prefix: str) -> None:
             )
 
 
+# ── In-memory job state (keyed by str(job_id)) ───────────────────────────────
+
+job_progress: dict[str, int] = {}
+_job_procs: dict[str, asyncio.subprocess.Process] = {}
+_cancelled: set[str] = set()
+
+
+def cancel_job(job_id: str) -> bool:
+    """Kill the running ffmpeg process for job_id. Returns False if not running."""
+    proc = _job_procs.get(job_id)
+    if proc is None:
+        return False
+    _cancelled.add(job_id)
+    proc.kill()
+    return True
+
+
 # ── FFmpeg ────────────────────────────────────────────────────────────────────
 
-async def _transcode(source: Path, out_dir: Path) -> None:
+async def _probe(source: Path) -> tuple[bool, float]:
+    """Return (has_audio, duration_seconds)."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "quiet",
+        "-show_entries", "format=duration:stream=codec_type",
+        "-of", "json", str(source),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    try:
+        data = json.loads(stdout)
+        has_audio = any(s.get("codec_type") == "audio" for s in data.get("streams", []))
+        duration = float(data.get("format", {}).get("duration", 0) or 0)
+        return has_audio, duration
+    except Exception:
+        return False, 0.0
+
+
+async def _transcode(source: Path, out_dir: Path, job_id: str) -> None:
     """Produce per-rendition HLS streams and a master playlist."""
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    has_audio, duration = await _probe(source)
 
     # Build filter_complex + output map for each rendition
     filter_parts: list[str] = []
@@ -71,13 +111,18 @@ async def _transcode(source: Path, out_dir: Path) -> None:
         filter_parts.append(f"[split{i}]")
         output_args += [
             f"-map", f"[out{i}]",
-            f"-map", "a:0",
-            f"-c:v:{i}", "h264_videotoolbox",
+            f"-c:v:{i}", "libx264",
             f"-b:v:{i}", _bitrate(label),
-            f"-c:a:{i}", "aac",
-            f"-b:a:{i}", "128k",
         ]
-        variant_streams.append(f"v:{i},a:{i},name:{label}")
+        if has_audio:
+            output_args += [
+                f"-map", "a:0",
+                f"-c:a:{i}", "aac",
+                f"-b:a:{i}", "128k",
+            ]
+        variant_streams.append(
+            f"v:{i},a:{i},name:{label}" if has_audio else f"v:{i},name:{label}"
+        )
 
     splits = "".join(filter_parts)
     filter_complex = f"[0:v]split={len(rendition_items)}{splits};" + ";".join(
@@ -98,14 +143,30 @@ async def _transcode(source: Path, out_dir: Path) -> None:
         str(out_dir / "%v.m3u8"),
     ]
 
+    job_progress[job_id] = 0
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        stdout=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await proc.communicate()
+    _job_procs[job_id] = proc
+
+    stderr_lines: list[str] = []
+    assert proc.stderr is not None
+    async for raw in proc.stderr:
+        line = raw.decode(errors="replace").rstrip()
+        stderr_lines.append(line)
+        if duration > 0:
+            m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
+            if m:
+                secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                job_progress[job_id] = min(99, int(secs / duration * 100))
+
+    _job_procs.pop(job_id, None)
+    await proc.wait()
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed:\n{stderr.decode()}")
+        raise RuntimeError(f"ffmpeg failed:\n" + "\n".join(stderr_lines[-60:]))
 
     # Write master playlist
     master_lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
@@ -192,7 +253,8 @@ async def process_job(conn, job: dict) -> None:
         await asyncio.get_event_loop().run_in_executor(None, _download, source_key, source_path)
 
         # 2. Transcode
-        await _transcode(source_path, out_dir)
+        await _transcode(source_path, out_dir, str(job_id))
+        job_progress[str(job_id)] = 100
 
         # 3. Upload HLS output
         hls_prefix = f"hls/{content_id}"
@@ -205,12 +267,20 @@ async def process_job(conn, job: dict) -> None:
         print(f"[transcode] job {job_id} → success")
 
     except Exception as exc:
-        error_msg = str(exc)
+        jid = str(job_id)
+        if jid in _cancelled:
+            error_msg = "Cancelled by admin"
+            _cancelled.discard(jid)
+        else:
+            error_msg = str(exc)
         print(f"[transcode] job {job_id} → failed: {error_msg}")
         await _mark_failed(conn, job_id, content_id, error_msg)
 
     finally:
+        jid = str(job_id)
         shutil.rmtree(tmpdir, ignore_errors=True)
+        job_progress.pop(jid, None)
+        _job_procs.pop(jid, None)
 
 
 # ── Module-level pool (set by run_worker, used by HTTP handlers) ──────────────
@@ -229,6 +299,8 @@ async def run_worker() -> None:
         min_size=2,
         max_size=settings.max_concurrent + 1,
         statement_cache_size=0,
+        # Recycle idle connections every 5 min so the DB server never drops them first
+        max_inactive_connection_lifetime=300,
     )
     semaphore = asyncio.Semaphore(settings.max_concurrent)
 
@@ -241,8 +313,18 @@ async def run_worker() -> None:
 
     try:
         while True:
-            async with pool.acquire() as conn:
-                job = await _claim_job(conn)
+            try:
+                async with pool.acquire() as conn:
+                    job = await _claim_job(conn)
+            except (
+                asyncpg.ConnectionDoesNotExistError,
+                asyncpg.InterfaceError,
+                asyncpg.TooManyConnectionsError,
+                OSError,
+            ) as exc:
+                print(f"[transcode] DB connection error, retrying in 5 s: {exc}")
+                await asyncio.sleep(5)
+                continue
 
             if job:
                 asyncio.create_task(handle(job))
