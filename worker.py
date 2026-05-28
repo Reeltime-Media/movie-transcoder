@@ -4,14 +4,14 @@ Flow per job:
   1. Claim a queued job (status → running, increment attempts).
   2. Download raw source from R2 to a temp file.
   3. Run ffmpeg to produce HLS with multiple renditions + master playlist.
-  4. Upload all .ts segments and .m3u8 playlists to R2 under hls/<content_id>/.
+  4. Upload HLS to R2 under movies/{slug}/hls/ or series/.../hls/ (legacy: hls/<content_id>/).
   5. Update content (hls_master_key, transcode_status → ready) and job (status → success).
   6. On any error: mark job failed, set content.transcode_status = failed.
 """
 
 import asyncio
+import concurrent.futures
 import json
-import os
 import re
 import shutil
 import tempfile
@@ -22,6 +22,7 @@ from pathlib import Path
 import asyncpg
 import boto3
 from botocore.config import Config
+from boto3.s3.transfer import TransferConfig
 
 from transcode_service.config import settings
 
@@ -43,19 +44,52 @@ def _download(key: str, dest: Path) -> None:
     _r2().download_file(settings.r2_bucket_name, key, str(dest))
 
 
+def _hls_prefix_for_source(source_key: str, content_id: uuid.UUID) -> str:
+    """Match movie-api app.services.r2_keys.hls_prefix_for_source_key."""
+    movie_match = re.fullmatch(r"movies/([^/]+)/source\.mp4", source_key)
+    if movie_match:
+        return f"movies/{movie_match.group(1)}/hls"
+
+    episode_match = re.fullmatch(
+        r"series/([^/]+)/episodes/([^/]+)/source\.mp4",
+        source_key,
+    )
+    if episode_match:
+        return (
+            f"series/{episode_match.group(1)}/episodes/{episode_match.group(2)}/hls"
+        )
+
+    return f"hls/{content_id}"
+
+
 def _upload_dir(local_dir: Path, prefix: str) -> None:
     client = _r2()
-    for path in local_dir.rglob("*"):
-        if path.is_file():
-            relative = path.relative_to(local_dir)
-            r2_key = f"{prefix}/{relative}"
-            content_type = "application/x-mpegURL" if path.suffix == ".m3u8" else "video/MP2T"
-            client.upload_file(
-                str(path),
-                settings.r2_bucket_name,
-                r2_key,
-                ExtraArgs={"ContentType": content_type},
-            )
+    files = [path for path in local_dir.rglob("*") if path.is_file()]
+    if not files:
+        return
+
+    transfer_config = TransferConfig(
+        max_concurrency=max(1, settings.r2_upload_concurrency),
+        use_threads=True,
+    )
+
+    def upload_one(path: Path) -> None:
+        relative = path.relative_to(local_dir)
+        r2_key = f"{prefix}/{relative}"
+        content_type = "application/x-mpegURL" if path.suffix == ".m3u8" else "video/MP2T"
+        client.upload_file(
+            str(path),
+            settings.r2_bucket_name,
+            r2_key,
+            ExtraArgs={"ContentType": content_type},
+            Config=transfer_config,
+        )
+
+    workers = min(max(1, settings.r2_upload_concurrency), len(files))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(upload_one, path) for path in files]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
 
 
 # ── In-memory job state (keyed by str(job_id)) ───────────────────────────────
@@ -80,7 +114,7 @@ def cancel_job(job_id: str) -> bool:
 async def _probe(source: Path) -> tuple[bool, float]:
     """Return (has_audio, duration_seconds)."""
     proc = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "quiet",
+        settings.ffprobe_path, "-v", "quiet",
         "-show_entries", "format=duration:stream=codec_type",
         "-of", "json", str(source),
         stdout=asyncio.subprocess.PIPE,
@@ -94,6 +128,18 @@ async def _probe(source: Path) -> tuple[bool, float]:
         return has_audio, duration
     except Exception:
         return False, 0.0
+
+
+def _video_codec_args(index: int) -> list[str]:
+    codec = settings.video_codec.strip().lower()
+    args = [f"-c:v:{index}", codec]
+
+    if codec == "libx264":
+        args += [f"-preset:v:{index}", settings.x264_preset]
+    elif codec == "h264_nvenc":
+        args += [f"-preset:v:{index}", "p4"]
+
+    return args
 
 
 async def _transcode(source: Path, out_dir: Path, job_id: str) -> None:
@@ -111,7 +157,7 @@ async def _transcode(source: Path, out_dir: Path, job_id: str) -> None:
         filter_parts.append(f"[split{i}]")
         output_args += [
             f"-map", f"[out{i}]",
-            f"-c:v:{i}", "libx264",
+            *_video_codec_args(i),
             f"-b:v:{i}", _bitrate(label),
         ]
         if has_audio:
@@ -256,8 +302,8 @@ async def process_job(conn, job: dict) -> None:
         await _transcode(source_path, out_dir, str(job_id))
         job_progress[str(job_id)] = 100
 
-        # 3. Upload HLS output
-        hls_prefix = f"hls/{content_id}"
+        # 3. Upload HLS output (path derived from source_key layout)
+        hls_prefix = _hls_prefix_for_source(source_key, content_id)
         await asyncio.get_event_loop().run_in_executor(None, _upload_dir, out_dir, hls_prefix)
 
         hls_master_key = f"{hls_prefix}/master.m3u8"

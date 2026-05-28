@@ -24,7 +24,14 @@ class Settings(BaseSettings):
 
     # FFmpeg
     ffmpeg_path: str = "ffmpeg"
+    ffprobe_path: str = "ffprobe"
+    # "libx264" (CPU), "h264_nvenc", "h264_qsv", "h264_vaapi", etc.
+    video_codec: str = "libx264"
+    # Used for software x264 encodes (e.g. ultrafast, superfast, veryfast, faster)
+    x264_preset: str = "veryfast"
     hls_segment_time: int = 6
+    # Segment upload concurrency to R2
+    r2_upload_concurrency: int = 12
     # Resolution label -> scale filter value
     renditions: dict[str, str] = {
         "1080p": "1920:1080",
