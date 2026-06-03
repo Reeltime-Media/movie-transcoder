@@ -45,5 +45,18 @@ class Settings(BaseSettings):
     # Max concurrent jobs
     max_concurrent: int = 2
 
+    # ── Retry / reliability ───────────────────────────────────────────────────
+    # Max transcode attempts before a job is marked permanently failed.
+    max_attempts: int = 3
+    # Per-attempt linear backoff before a failed job is eligible to retry.
+    # Effective delay before re-claim = retry_backoff_seconds * attempts.
+    retry_backoff_seconds: int = 60
+    # A job stuck in 'running' longer than this (e.g. the worker was killed
+    # mid-transcode) is reclaimed by the reaper. MUST exceed your longest
+    # expected transcode, or a live job could be reclaimed and run twice.
+    running_timeout_seconds: int = 3600
+    # How often the reaper scans for stuck 'running' jobs.
+    reaper_interval: int = 120
+
 
 settings = Settings()

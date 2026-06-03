@@ -237,7 +237,13 @@ def _bitrate(label: str) -> str:
 # ── DB helpers (asyncpg direct) ───────────────────────────────────────────────
 
 async def _claim_job(conn) -> dict | None:
-    """Atomically claim the oldest queued job."""
+    """Atomically claim the oldest eligible queued job.
+
+    A freshly enqueued job (finished_at IS NULL) is eligible immediately. A job
+    that previously failed and was requeued carries finished_at = time of that
+    failure, so it only becomes eligible again after a per-attempt backoff
+    (retry_backoff_seconds * attempts).
+    """
     row = await conn.fetchrow("""
         UPDATE transcode_jobs
         SET status = 'running',
@@ -246,12 +252,16 @@ async def _claim_job(conn) -> dict | None:
         WHERE id = (
             SELECT id FROM transcode_jobs
             WHERE status = 'queued'
+              AND (
+                  finished_at IS NULL
+                  OR finished_at <= now() - make_interval(secs => $1 * attempts)
+              )
             ORDER BY created_at
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         )
         RETURNING id, content_id, source_key, attempts
-    """)
+    """, settings.retry_backoff_seconds)
     return dict(row) if row else None
 
 
@@ -271,6 +281,7 @@ async def _mark_success(conn, job_id: uuid.UUID, content_id: uuid.UUID, hls_mast
 
 
 async def _mark_failed(conn, job_id: uuid.UUID, content_id: uuid.UUID, error: str) -> None:
+    """Permanently fail a job and its content (no further retries)."""
     await conn.execute("""
         UPDATE transcode_jobs
         SET status = 'failed', finished_at = now(), error = $2
@@ -281,6 +292,84 @@ async def _mark_failed(conn, job_id: uuid.UUID, content_id: uuid.UUID, error: st
         SET transcode_status = 'failed', updated_at = now()
         WHERE id = $1
     """, content_id)
+
+
+async def _requeue(conn, job_id: uuid.UUID, error: str) -> None:
+    """Put a failed-but-retryable job back on the queue.
+
+    finished_at is set to now() so the per-attempt backoff in _claim_job applies
+    before the job is eligible again. content.transcode_status is left untouched
+    so it keeps reflecting in-progress until attempts are exhausted.
+    """
+    await conn.execute("""
+        UPDATE transcode_jobs
+        SET status = 'queued', started_at = NULL, finished_at = now(), error = $2
+        WHERE id = $1
+    """, job_id, error)
+
+
+async def _fail_or_retry(
+    conn,
+    job_id: uuid.UUID,
+    content_id: uuid.UUID,
+    attempts: int,
+    error: str,
+    *,
+    retryable: bool = True,
+) -> str:
+    """Requeue a job if attempts remain, otherwise fail it permanently.
+
+    `attempts` is the value after this attempt's increment (as returned by
+    _claim_job). Returns 'queued' or 'failed'.
+    """
+    if retryable and attempts < settings.max_attempts:
+        await _requeue(conn, job_id, error)
+        return "queued"
+    await _mark_failed(conn, job_id, content_id, error)
+    return "failed"
+
+
+async def _reap_stuck_jobs(conn) -> None:
+    """Reclaim jobs left in 'running' by a crashed or killed worker.
+
+    A job running past running_timeout_seconds is requeued (if attempts remain)
+    or failed. The timeout must exceed the longest expected transcode, otherwise
+    a genuinely-running job could be reclaimed and processed twice.
+    """
+    requeued = await conn.fetch("""
+        UPDATE transcode_jobs
+        SET status = 'queued', started_at = NULL, finished_at = now(),
+            error = 'Reclaimed: stuck in running past timeout'
+        WHERE status = 'running'
+          AND started_at IS NOT NULL
+          AND started_at <= now() - make_interval(secs => $1)
+          AND attempts < $2
+        RETURNING id
+    """, settings.running_timeout_seconds, settings.max_attempts)
+
+    failed = await conn.fetch("""
+        UPDATE transcode_jobs
+        SET status = 'failed', finished_at = now(),
+            error = 'Reclaimed: stuck in running past timeout (max attempts reached)'
+        WHERE status = 'running'
+          AND started_at IS NOT NULL
+          AND started_at <= now() - make_interval(secs => $1)
+          AND attempts >= $2
+        RETURNING id, content_id
+    """, settings.running_timeout_seconds, settings.max_attempts)
+
+    for row in failed:
+        await conn.execute("""
+            UPDATE content
+            SET transcode_status = 'failed', updated_at = now()
+            WHERE id = $1
+        """, row["content_id"])
+
+    if requeued or failed:
+        print(
+            f"[transcode] reaper: requeued {len(requeued)}, "
+            f"failed {len(failed)} stuck job(s)"
+        )
 
 
 # ── Main job handler ──────────────────────────────────────────────────────────
@@ -314,13 +403,25 @@ async def process_job(conn, job: dict) -> None:
 
     except Exception as exc:
         jid = str(job_id)
+        attempts = int(job.get("attempts", settings.max_attempts))
         if jid in _cancelled:
+            # Admin-cancelled jobs are terminal — never retry them.
             error_msg = "Cancelled by admin"
             _cancelled.discard(jid)
+            retryable = False
         else:
             error_msg = str(exc)
-        print(f"[transcode] job {job_id} → failed: {error_msg}")
-        await _mark_failed(conn, job_id, content_id, error_msg)
+            retryable = True
+        outcome = await _fail_or_retry(
+            conn, job_id, content_id, attempts, error_msg, retryable=retryable
+        )
+        if outcome == "queued":
+            print(
+                f"[transcode] job {job_id} → failed "
+                f"(attempt {attempts}/{settings.max_attempts}), requeued: {error_msg}"
+            )
+        else:
+            print(f"[transcode] job {job_id} → failed permanently: {error_msg}")
 
     finally:
         jid = str(job_id)
@@ -343,7 +444,9 @@ async def run_worker() -> None:
     pool = await asyncpg.create_pool(
         dsn,
         min_size=2,
-        max_size=settings.max_concurrent + 1,
+        # max_concurrent job handlers + the claim loop + the reaper, each of
+        # which may briefly hold a connection at the same time.
+        max_size=settings.max_concurrent + 2,
         statement_cache_size=0,
         # Recycle idle connections every 5 min so the DB server never drops them first
         max_inactive_connection_lifetime=300,
@@ -353,12 +456,30 @@ async def run_worker() -> None:
     print("[transcode] worker started")
 
     async def handle(job):
-        async with semaphore:
+        # The semaphore permit was acquired by the polling loop before this job
+        # was claimed; release it here once the job is fully processed.
+        try:
             async with pool.acquire() as conn:
                 await process_job(conn, job)
+        finally:
+            semaphore.release()
 
+    async def reaper_loop():
+        while True:
+            await asyncio.sleep(settings.reaper_interval)
+            try:
+                async with pool.acquire() as conn:
+                    await _reap_stuck_jobs(conn)
+            except Exception as exc:
+                print(f"[transcode] reaper error: {exc}")
+
+    reaper_task = asyncio.create_task(reaper_loop())
     try:
         while True:
+            # Acquire a slot BEFORE claiming so we never mark more jobs 'running'
+            # than we can actually process concurrently. The permit is released
+            # by handle() when the job finishes, or below if nothing is claimed.
+            await semaphore.acquire()
             try:
                 async with pool.acquire() as conn:
                     job = await _claim_job(conn)
@@ -368,6 +489,7 @@ async def run_worker() -> None:
                 asyncpg.TooManyConnectionsError,
                 OSError,
             ) as exc:
+                semaphore.release()
                 print(f"[transcode] DB connection error, retrying in 5 s: {exc}")
                 await asyncio.sleep(5)
                 continue
@@ -375,9 +497,11 @@ async def run_worker() -> None:
             if job:
                 asyncio.create_task(handle(job))
             else:
+                semaphore.release()
                 await asyncio.sleep(settings.poll_interval)
     except asyncio.CancelledError:
         print("[transcode] worker shutting down")
     finally:
+        reaper_task.cancel()
         await pool.close()
         pool = None

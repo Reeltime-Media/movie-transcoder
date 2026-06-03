@@ -121,7 +121,8 @@ async def retry_job(job_id: uuid.UUID):
     updated = await pool.fetchrow(
         """
         UPDATE transcode_jobs
-        SET status = 'queued', error = NULL, started_at = NULL, finished_at = NULL
+        SET status = 'queued', error = NULL, started_at = NULL, finished_at = NULL,
+            attempts = 0
         WHERE id = $1
         RETURNING *
         """,
