@@ -58,5 +58,12 @@ class Settings(BaseSettings):
     # How often the reaper scans for stuck 'running' jobs.
     reaper_interval: int = 120
 
+    # Dashboard / multi-worker cluster
+    worker_name: str = "transcode"
+    # This worker's public base URL (e.g. http://35.240.137.149:8001)
+    worker_public_url: str = ""
+    # Comma-separated peer worker URLs for aggregated progress on /dashboard
+    peer_worker_urls: str = ""
+
 
 settings = Settings()

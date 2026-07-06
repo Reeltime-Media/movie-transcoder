@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from transcode_service.config import settings
-from transcode_service.routers import jobs
+from transcode_service.routers import dashboard, jobs
 from transcode_service import worker as worker_module
 
 
@@ -41,6 +41,7 @@ app.add_middleware(
 )
 
 app.include_router(jobs.router)
+app.include_router(dashboard.router)
 
 
 @app.get("/health", tags=["health"])
