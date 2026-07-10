@@ -25,6 +25,7 @@ from botocore.config import Config
 from boto3.s3.transfer import TransferConfig
 
 from transcode_service.config import settings
+from transcode_service import r2_scan
 
 
 # ── R2 helpers ────────────────────────────────────────────────────────────────
@@ -44,22 +45,14 @@ def _download(key: str, dest: Path) -> None:
     _r2().download_file(settings.r2_bucket_name, key, str(dest))
 
 
-def _hls_prefix_for_source(source_key: str, content_id: uuid.UUID) -> str:
+def _hls_prefix_for_source(source_key: str, content_id: uuid.UUID | None = None) -> str:
     """Match movie-api app.services.r2_keys.hls_prefix_for_source_key."""
-    movie_match = re.fullmatch(r"movies/([^/]+)/source\.mp4", source_key)
-    if movie_match:
-        return f"movies/{movie_match.group(1)}/hls"
-
-    episode_match = re.fullmatch(
-        r"series/([^/]+)/episodes/([^/]+)/source\.mp4",
-        source_key,
-    )
-    if episode_match:
-        return (
-            f"series/{episode_match.group(1)}/episodes/{episode_match.group(2)}/hls"
-        )
-
-    return f"hls/{content_id}"
+    try:
+        return r2_scan.hls_prefix_for_source(source_key)
+    except ValueError:
+        if content_id is not None:
+            return f"hls/{content_id}"
+        raise
 
 
 def _upload_dir(local_dir: Path, prefix: str) -> None:
@@ -92,11 +85,15 @@ def _upload_dir(local_dir: Path, prefix: str) -> None:
             future.result()
 
 
-# ── In-memory job state (keyed by str(job_id)) ───────────────────────────────
+# ── In-memory job state (keyed by str(job_id) or source_key in R2 scan mode) ──
 
 job_progress: dict[str, int] = {}
 _job_procs: dict[str, asyncio.subprocess.Process] = {}
 _cancelled: set[str] = set()
+
+# R2 scan mode job metadata (no Supabase)
+r2_jobs: dict[str, dict] = {}
+_r2_attempts: dict[str, int] = {}
 
 
 def cancel_job(job_id: str) -> bool:
@@ -248,7 +245,8 @@ async def _claim_job(conn) -> dict | None:
         UPDATE transcode_jobs
         SET status = 'running',
             attempts = attempts + 1,
-            started_at = now()
+            started_at = now(),
+            worker_name = $2
         WHERE id = (
             SELECT id FROM transcode_jobs
             WHERE status = 'queued'
@@ -261,7 +259,7 @@ async def _claim_job(conn) -> dict | None:
             FOR UPDATE SKIP LOCKED
         )
         RETURNING id, content_id, source_key, attempts
-    """, settings.retry_backoff_seconds)
+    """, settings.retry_backoff_seconds, settings.worker_name)
     return dict(row) if row else None
 
 
@@ -303,7 +301,8 @@ async def _requeue(conn, job_id: uuid.UUID, error: str) -> None:
     """
     await conn.execute("""
         UPDATE transcode_jobs
-        SET status = 'queued', started_at = NULL, finished_at = now(), error = $2
+        SET status = 'queued', started_at = NULL, finished_at = now(), error = $2,
+            worker_name = NULL
         WHERE id = $1
     """, job_id, error)
 
@@ -374,32 +373,111 @@ async def _reap_stuck_jobs(conn) -> None:
 
 # ── Main job handler ──────────────────────────────────────────────────────────
 
-async def process_job(conn, job: dict) -> None:
-    job_id: uuid.UUID = job["id"]
-    content_id: uuid.UUID = job["content_id"]
-    source_key: str = job["source_key"]
+def _title_from_source(source_key: str) -> str:
+    movie_match = re.fullmatch(r"movies/([^/]+)/source\.mp4", source_key)
+    if movie_match:
+        return movie_match.group(1)
+    episode_match = re.fullmatch(
+        r"series/([^/]+)/episodes/([^/]+)/source\.mp4",
+        source_key,
+    )
+    if episode_match:
+        return f"{episode_match.group(1)} / {episode_match.group(2)}"
+    return source_key
 
+
+async def _run_transcode_pipeline(source_key: str, job_id: str) -> str:
+    """Download, transcode, upload. Returns hls_master_key."""
     tmpdir = tempfile.mkdtemp()
     try:
         source_path = Path(tmpdir) / "source.mp4"
         out_dir = Path(tmpdir) / "hls"
 
-        # 1. Download
-        await asyncio.get_event_loop().run_in_executor(None, _download, source_key, source_path)
+        await asyncio.get_event_loop().run_in_executor(
+            None, _download, source_key, source_path
+        )
+        await _transcode(source_path, out_dir, job_id)
+        job_progress[job_id] = 100
 
-        # 2. Transcode
-        await _transcode(source_path, out_dir, str(job_id))
-        job_progress[str(job_id)] = 100
+        hls_prefix = _hls_prefix_for_source(source_key)
+        await asyncio.get_event_loop().run_in_executor(
+            None, _upload_dir, out_dir, hls_prefix
+        )
+        return f"{hls_prefix}/master.m3u8"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
-        # 3. Upload HLS output (path derived from source_key layout)
-        hls_prefix = _hls_prefix_for_source(source_key, content_id)
-        await asyncio.get_event_loop().run_in_executor(None, _upload_dir, out_dir, hls_prefix)
 
-        hls_master_key = f"{hls_prefix}/master.m3u8"
+async def process_r2_source(source_key: str) -> None:
+    """Transcode one R2 object without touching Supabase."""
+    job_id = source_key
+    attempts = _r2_attempts.get(source_key, 0) + 1
+    _r2_attempts[source_key] = attempts
+    r2_jobs[source_key] = {
+        "id": source_key,
+        "source_key": source_key,
+        "title": _title_from_source(source_key),
+        "status": "running",
+        "worker": settings.worker_name,
+        "attempts": attempts,
+        "error": None,
+    }
 
-        # 4. Update DB
+    try:
+        hls_master_key = await _run_transcode_pipeline(source_key, job_id)
+        r2_scan.release_lock(source_key)
+        r2_scan.clear_failed_marker(source_key)
+        _r2_attempts.pop(source_key, None)
+        r2_jobs[source_key] = {
+            **r2_jobs[source_key],
+            "status": "success",
+            "hls_master_key": hls_master_key,
+            "error": None,
+        }
+        print(f"[transcode] r2 {source_key} -> success")
+    except Exception as exc:
+        jid = job_id
+        if jid in _cancelled:
+            error_msg = "Cancelled by admin"
+            _cancelled.discard(jid)
+            retryable = False
+        else:
+            error_msg = str(exc)
+            retryable = True
+
+        r2_jobs[source_key] = {
+            **r2_jobs.get(source_key, {}),
+            "id": source_key,
+            "source_key": source_key,
+            "title": _title_from_source(source_key),
+            "status": "failed" if not retryable or attempts >= settings.max_attempts else "queued",
+            "worker": settings.worker_name,
+            "attempts": attempts,
+            "error": error_msg,
+        }
+        r2_scan.release_lock(source_key)
+        if not retryable or attempts >= settings.max_attempts:
+            r2_scan.write_failed_marker(source_key, error_msg, attempts)
+            print(f"[transcode] r2 {source_key} -> failed permanently: {error_msg}")
+        else:
+            print(
+                f"[transcode] r2 {source_key} -> failed "
+                f"(attempt {attempts}/{settings.max_attempts}), will retry: {error_msg}"
+            )
+    finally:
+        job_progress.pop(job_id, None)
+        _job_procs.pop(job_id, None)
+
+
+async def process_job(conn, job: dict) -> None:
+    job_id: uuid.UUID = job["id"]
+    content_id: uuid.UUID = job["content_id"]
+    source_key: str = job["source_key"]
+
+    try:
+        hls_master_key = await _run_transcode_pipeline(source_key, str(job_id))
         await _mark_success(conn, job_id, content_id, hls_master_key)
-        print(f"[transcode] job {job_id} → success")
+        print(f"[transcode] job {job_id} -> success")
 
     except Exception as exc:
         jid = str(job_id)
@@ -425,20 +503,74 @@ async def process_job(conn, job: dict) -> None:
 
     finally:
         jid = str(job_id)
-        shutil.rmtree(tmpdir, ignore_errors=True)
         job_progress.pop(jid, None)
         _job_procs.pop(jid, None)
 
 
-# ── Module-level pool (set by run_worker, used by HTTP handlers) ──────────────
-
+# Module-level pool (DB mode only; None in R2 scan mode)
 pool: asyncpg.Pool | None = None
+worker_ready: bool = False
+
+
+async def run_r2_scan_worker() -> None:
+    """Scan R2 for source.mp4 files and transcode without Supabase."""
+    global pool, worker_ready
+    pool = None
+    worker_ready = True
+    semaphore = asyncio.Semaphore(settings.max_concurrent)
+
+    print("[transcode] R2 scan worker started (no Supabase)")
+
+    async def stats_loop():
+        while True:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, r2_scan.refresh_dashboard_stats
+                )
+            except Exception as exc:
+                print(f"[transcode] stats refresh error: {exc}")
+            await asyncio.sleep(90)
+
+    asyncio.create_task(stats_loop())
+    # Prime stats cache immediately
+    asyncio.get_event_loop().run_in_executor(None, r2_scan.refresh_dashboard_stats)
+
+    async def handle(source_key: str) -> None:
+        try:
+            await process_r2_source(source_key)
+        finally:
+            semaphore.release()
+
+    try:
+        while True:
+            await semaphore.acquire()
+            try:
+                source_key = await asyncio.get_event_loop().run_in_executor(
+                    None, r2_scan.claim_next_source, settings.worker_name
+                )
+            except Exception as exc:
+                semaphore.release()
+                print(f"[transcode] R2 scan error, retrying in 5 s: {exc}")
+                await asyncio.sleep(5)
+                continue
+
+            if source_key:
+                asyncio.create_task(handle(source_key))
+            else:
+                semaphore.release()
+                await asyncio.sleep(settings.r2_scan_interval)
+    except asyncio.CancelledError:
+        print("[transcode] R2 scan worker shutting down")
 
 
 # ── Polling loop ──────────────────────────────────────────────────────────────
 
 async def run_worker() -> None:
-    global pool
+    if settings.r2_scan_mode:
+        await run_r2_scan_worker()
+        return
+
+    global pool, worker_ready
     # asyncpg uses the raw postgresql:// URL (strip the +asyncpg driver prefix)
     dsn = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
     pool = await asyncpg.create_pool(
@@ -453,6 +585,7 @@ async def run_worker() -> None:
     )
     semaphore = asyncio.Semaphore(settings.max_concurrent)
 
+    worker_ready = True
     print("[transcode] worker started")
 
     async def handle(job):
@@ -505,3 +638,4 @@ async def run_worker() -> None:
         reaper_task.cancel()
         await pool.close()
         pool = None
+        worker_ready = False

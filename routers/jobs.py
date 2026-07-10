@@ -122,7 +122,7 @@ async def retry_job(job_id: uuid.UUID):
         """
         UPDATE transcode_jobs
         SET status = 'queued', error = NULL, started_at = NULL, finished_at = NULL,
-            attempts = 0
+            attempts = 0, worker_name = NULL
         WHERE id = $1
         RETURNING *
         """,

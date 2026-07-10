@@ -46,7 +46,11 @@ app.include_router(dashboard.router)
 
 @app.get("/health", tags=["health"])
 async def health():
-    return {"status": "ok", "worker": "running" if worker_module.pool is not None else "starting"}
+    return {
+        "status": "ok",
+        "worker": "running" if worker_module.worker_ready else "starting",
+        "r2_scan_mode": settings.r2_scan_mode,
+    }
 
 
 if __name__ == "__main__":

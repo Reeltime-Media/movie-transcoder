@@ -1,3 +1,4 @@
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,8 +13,16 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440
 
-    # Direct asyncpg connection (no pooler) for long-running worker
-    database_url: str  # postgresql+asyncpg://...
+    # Direct asyncpg connection (not pooler) for long-running worker.
+    # Not required when R2_SCAN_MODE=true.
+    database_url: str = ""
+
+    # R2-only mode: scan bucket for source.mp4, transcode to HLS, no Supabase writes.
+    r2_scan_mode: bool = False
+    # Seconds between R2 scans when no work is available.
+    r2_scan_interval: int = 5
+    # Reclaim a stale .transcode.lock after this many seconds.
+    r2_lock_timeout_seconds: int = 7200
 
     # Cloudflare R2
     r2_account_id: str
@@ -64,6 +73,12 @@ class Settings(BaseSettings):
     worker_public_url: str = ""
     # Comma-separated peer worker URLs for aggregated progress on /dashboard
     peer_worker_urls: str = ""
+
+    @model_validator(mode="after")
+    def _require_database_unless_r2_scan(self) -> "Settings":
+        if not self.r2_scan_mode and not self.database_url.strip():
+            raise ValueError("DATABASE_URL is required unless R2_SCAN_MODE=true")
+        return self
 
 
 settings = Settings()
