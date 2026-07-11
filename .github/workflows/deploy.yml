@@ -7,7 +7,8 @@ on:
     branches: [main]
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/transcode-service
+  # GHCR requires lowercase owner/name
+  IMAGE: ghcr.io/reeltime-media/transcode-service
 
 jobs:
   # ── CI: runs on every PR and push ──────────────────────────────────────────
@@ -29,16 +30,19 @@ jobs:
       - name: Run tests
         run: pytest -q || [ $? -eq 5 ]  # exit 5 = "no tests collected", not a failure
 
-  # ── CD: build image, push to GHCR, deploy to EC2 Spot (main only) ───────────
-  deploy:
+  # ── Build once, push to GHCR (main only) ───────────────────────────────────
+  build:
     needs: test
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -58,16 +62,77 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Deploy to EC2 over SSH
-        uses: appleboy/ssh-action@v1
+  # ── Deploy image to each GCP worker (main only) ────────────────────────────
+  deploy:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        host_secret: [GCE_HOST_1, GCE_HOST_2, GCE_HOST_3]
+    steps:
+      - name: Resolve worker host
+        id: host
+        env:
+          H1: ${{ secrets.GCE_HOST_1 }}
+          H2: ${{ secrets.GCE_HOST_2 }}
+          H3: ${{ secrets.GCE_HOST_3 }}
+        run: |
+          case "${{ matrix.host_secret }}" in
+            GCE_HOST_1) HOST="$H1" ;;
+            GCE_HOST_2) HOST="$H2" ;;
+            GCE_HOST_3) HOST="$H3" ;;
+          esac
+          if [ -z "$HOST" ]; then
+            echo "Skipping — secret ${{ matrix.host_secret }} not set"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "value=$HOST" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to GCP worker over SSH
+        if: steps.host.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.2.0
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
+          host: ${{ steps.host.outputs.value }}
+          username: ${{ secrets.GCE_USER }}
+          key: ${{ secrets.GCE_SSH_KEY }}
+          script_stop: true
           script: |
-            set -e
-            echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            cd ${{ secrets.DEPLOY_DIR }}
-            docker compose pull transcode
-            docker compose up -d transcode
-            docker image prune -f
+            set -euo pipefail
+            DEPLOY_DIR="${{ secrets.DEPLOY_DIR }}"
+            IMAGE="${{ env.IMAGE }}"
+
+            echo "${{ secrets.GITHUB_TOKEN }}" | sudo docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            cd "$DEPLOY_DIR"
+            sudo tee docker-compose.yml >/dev/null <<'EOF'
+            services:
+              transcode:
+                image: IMAGE_PLACEHOLDER:latest
+                ports:
+                  - "8001:8001"
+                env_file:
+                  - ./movie-api/.env
+                  - ./worker.env
+                environment:
+                  MAX_CONCURRENT: ${MAX_CONCURRENT:-1}
+                  X264_PRESET: ${X264_PRESET:-faster}
+                  R2_UPLOAD_CONCURRENCY: ${R2_UPLOAD_CONCURRENCY:-16}
+                  R2_SCAN_MODE: ${R2_SCAN_MODE:-true}
+                  R2_SCAN_INTERVAL: ${R2_SCAN_INTERVAL:-5}
+                restart: unless-stopped
+                command: uvicorn transcode_service.main:app --host 0.0.0.0 --port 8001 --loop asyncio
+            EOF
+            # Strip the leading spaces introduced by the Actions script indent
+            sudo sed -i 's/^            //' docker-compose.yml
+            sudo sed -i "s|IMAGE_PLACEHOLDER|${IMAGE}|g" docker-compose.yml
+
+            sudo docker compose pull transcode
+            sudo docker compose up -d transcode
+            sudo docker image prune -f
