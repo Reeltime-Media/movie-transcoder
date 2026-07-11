@@ -11,7 +11,6 @@ env:
   IMAGE: ghcr.io/reeltime-media/transcode-service
 
 jobs:
-  # ── CI: runs on every PR and push ──────────────────────────────────────────
   test:
     runs-on: ubuntu-latest
     steps:
@@ -28,9 +27,8 @@ jobs:
           pip install pytest
 
       - name: Run tests
-        run: pytest -q || [ $? -eq 5 ]  # exit 5 = "no tests collected", not a failure
+        run: pytest -q || [ $? -eq 5 ]
 
-  # ── Build once, push to GHCR (main only) ───────────────────────────────────
   build:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -62,7 +60,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── Deploy image to each GCP worker (main only) ────────────────────────────
   deploy:
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -98,41 +95,43 @@ jobs:
       - name: Deploy to GCP worker over SSH
         if: steps.host.outputs.skip != 'true'
         uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
         with:
           host: ${{ steps.host.outputs.value }}
           username: ${{ secrets.GCE_USER }}
           key: ${{ secrets.GCE_SSH_KEY }}
+          envs: IMAGE,DEPLOY_DIR,GHCR_TOKEN,GHCR_USER
           script_stop: true
           script: |
             set -euo pipefail
-            DEPLOY_DIR="${{ secrets.DEPLOY_DIR }}"
-            IMAGE="${{ env.IMAGE }}"
-
-            echo "${{ secrets.GITHUB_TOKEN }}" | sudo docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-            cd "$DEPLOY_DIR"
-            sudo tee docker-compose.yml >/dev/null <<'EOF'
+            echo "$GHCR_TOKEN" | sudo docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            sudo mkdir -p "$DEPLOY_DIR"
+            sudo tee "$DEPLOY_DIR/docker-compose.yml" > /dev/null <<EOF
             services:
               transcode:
-                image: IMAGE_PLACEHOLDER:latest
+                image: "${IMAGE}:latest"
                 ports:
                   - "8001:8001"
                 env_file:
                   - ./movie-api/.env
                   - ./worker.env
                 environment:
-                  MAX_CONCURRENT: ${MAX_CONCURRENT:-1}
-                  X264_PRESET: ${X264_PRESET:-faster}
-                  R2_UPLOAD_CONCURRENCY: ${R2_UPLOAD_CONCURRENCY:-16}
-                  R2_SCAN_MODE: ${R2_SCAN_MODE:-true}
-                  R2_SCAN_INTERVAL: ${R2_SCAN_INTERVAL:-5}
+                  MAX_CONCURRENT: \${MAX_CONCURRENT:-1}
+                  X264_PRESET: \${X264_PRESET:-faster}
+                  R2_UPLOAD_CONCURRENCY: \${R2_UPLOAD_CONCURRENCY:-16}
+                  R2_SCAN_MODE: \${R2_SCAN_MODE:-true}
+                  R2_SCAN_INTERVAL: \${R2_SCAN_INTERVAL:-5}
                 restart: unless-stopped
                 command: uvicorn transcode_service.main:app --host 0.0.0.0 --port 8001 --loop asyncio
             EOF
-            # Strip the leading spaces introduced by the Actions script indent
-            sudo sed -i 's/^            //' docker-compose.yml
-            sudo sed -i "s|IMAGE_PLACEHOLDER|${IMAGE}|g" docker-compose.yml
-
-            sudo docker compose pull transcode
-            sudo docker compose up -d transcode
+            # Normalize indentation: drop common leading whitespace from tee content
+            sudo sed -i 's/^[[:space:]]\{0,12\}//' "$DEPLOY_DIR/docker-compose.yml"
+            echo "---- compose ----"
+            sudo cat "$DEPLOY_DIR/docker-compose.yml"
+            sudo docker compose --project-directory "$DEPLOY_DIR" -f "$DEPLOY_DIR/docker-compose.yml" pull transcode
+            sudo docker compose --project-directory "$DEPLOY_DIR" -f "$DEPLOY_DIR/docker-compose.yml" up -d transcode
             sudo docker image prune -f
