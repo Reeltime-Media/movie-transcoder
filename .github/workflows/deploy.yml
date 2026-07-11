@@ -110,6 +110,7 @@ jobs:
             set -euo pipefail
             echo "$GHCR_TOKEN" | sudo docker login ghcr.io -u "$GHCR_USER" --password-stdin
             sudo mkdir -p "$DEPLOY_DIR"
+            # Heredoc body must keep relative YAML indent; do not strip spaces.
             sudo tee "$DEPLOY_DIR/docker-compose.yml" > /dev/null <<EOF
             services:
               transcode:
@@ -128,8 +129,6 @@ jobs:
                 restart: unless-stopped
                 command: uvicorn transcode_service.main:app --host 0.0.0.0 --port 8001 --loop asyncio
             EOF
-            # Normalize indentation: drop common leading whitespace from tee content
-            sudo sed -i 's/^[[:space:]]\{0,12\}//' "$DEPLOY_DIR/docker-compose.yml"
             echo "---- compose ----"
             sudo cat "$DEPLOY_DIR/docker-compose.yml"
             sudo docker compose --project-directory "$DEPLOY_DIR" -f "$DEPLOY_DIR/docker-compose.yml" pull transcode
