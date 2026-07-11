@@ -105,30 +105,12 @@ jobs:
           username: ${{ secrets.GCE_USER }}
           key: ${{ secrets.GCE_SSH_KEY }}
           envs: IMAGE,DEPLOY_DIR,GHCR_TOKEN,GHCR_USER
-          script_stop: true
+          script_stop: false
           script: |
             set -euo pipefail
             echo "$GHCR_TOKEN" | sudo docker login ghcr.io -u "$GHCR_USER" --password-stdin
             sudo mkdir -p "$DEPLOY_DIR"
-            # Heredoc body must keep relative YAML indent; do not strip spaces.
-            sudo tee "$DEPLOY_DIR/docker-compose.yml" > /dev/null <<EOF
-            services:
-              transcode:
-                image: "${IMAGE}:latest"
-                ports:
-                  - "8001:8001"
-                env_file:
-                  - ./movie-api/.env
-                  - ./worker.env
-                environment:
-                  MAX_CONCURRENT: \${MAX_CONCURRENT:-1}
-                  X264_PRESET: \${X264_PRESET:-faster}
-                  R2_UPLOAD_CONCURRENCY: \${R2_UPLOAD_CONCURRENCY:-16}
-                  R2_SCAN_MODE: \${R2_SCAN_MODE:-true}
-                  R2_SCAN_INTERVAL: \${R2_SCAN_INTERVAL:-5}
-                restart: unless-stopped
-                command: uvicorn transcode_service.main:app --host 0.0.0.0 --port 8001 --loop asyncio
-            EOF
+            echo 'c2VydmljZXM6CiAgdHJhbnNjb2RlOgogICAgaW1hZ2U6ICJJTUFHRV9QTEFDRUhPTERFUiIKICAgIHBvcnRzOgogICAgICAtICI4MDAxOjgwMDEiCiAgICBlbnZfZmlsZToKICAgICAgLSAuL21vdmllLWFwaS8uZW52CiAgICAgIC0gLi93b3JrZXIuZW52CiAgICBlbnZpcm9ubWVudDoKICAgICAgTUFYX0NPTkNVUlJFTlQ6ICR7TUFYX0NPTkNVUlJFTlQ6LTF9CiAgICAgIFgyNjRfUFJFU0VUOiAke1gyNjRfUFJFU0VUOi1mYXN0ZXJ9CiAgICAgIFIyX1VQTE9BRF9DT05DVVJSRU5DWTogJHtSMl9VUExPQURfQ09OQ1VSUkVOQ1k6LTE2fQogICAgICBSMl9TQ0FOX01PREU6ICR7UjJfU0NBTl9NT0RFOi10cnVlfQogICAgICBSMl9TQ0FOX0lOVEVSVkFMOiAke1IyX1NDQU5fSU5URVJWQUw6LTV9CiAgICByZXN0YXJ0OiB1bmxlc3Mtc3RvcHBlZAogICAgY29tbWFuZDogdXZpY29ybiB0cmFuc2NvZGVfc2VydmljZS5tYWluOmFwcCAtLWhvc3QgMC4wLjAuMCAtLXBvcnQgODAwMSAtLWxvb3AgYXN5bmNpbwo=' | base64 -d | sed "s|IMAGE_PLACEHOLDER|${IMAGE}:latest|" | sudo tee "$DEPLOY_DIR/docker-compose.yml" > /dev/null
             echo "---- compose ----"
             sudo cat "$DEPLOY_DIR/docker-compose.yml"
             sudo docker compose --project-directory "$DEPLOY_DIR" -f "$DEPLOY_DIR/docker-compose.yml" pull transcode
