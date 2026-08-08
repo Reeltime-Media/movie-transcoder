@@ -69,10 +69,19 @@ class Settings(BaseSettings):
 
     # Dashboard / multi-worker cluster
     worker_name: str = "transcode"
-    # This worker's public base URL (e.g. http://35.240.137.149:8001)
+    # This worker's public base URL (e.g. http://35.240.137.149:8001). Also
+    # used to build live channel HLS URLs — see live_manager.py.
     worker_public_url: str = ""
     # Comma-separated peer worker URLs for aggregated progress on /dashboard
     peer_worker_urls: str = ""
+
+    # ── Live TV restream (separate from the VOD job queue above) ─────────────
+    # Local directory where each channel's rolling HLS output is written and
+    # served from (see main.py's /live static mount). Ephemeral by design —
+    # live segments aren't meant to persist, so no volume mount is required.
+    live_output_dir: str = "/tmp/live"
+    live_hls_segment_time: int = 6
+    live_hls_list_size: int = 8
 
     @model_validator(mode="after")
     def _require_database_unless_r2_scan(self) -> "Settings":

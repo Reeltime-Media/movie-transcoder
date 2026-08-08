@@ -1,16 +1,27 @@
 import asyncio
+import mimetypes
 import os
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from transcode_service.config import settings
-from transcode_service.routers import dashboard, jobs
+from transcode_service.routers import dashboard, jobs, live
+from transcode_service import live_manager
 from transcode_service import worker as worker_module
+
+# Not registered in the stdlib mimetypes DB on every platform — HLS clients
+# don't strictly require these, but set them for correctness.
+mimetypes.add_type("application/vnd.apple.mpegurl", ".m3u8")
+mimetypes.add_type("video/mp2t", ".ts")
+
+Path(settings.live_output_dir).mkdir(parents=True, exist_ok=True)
 
 
 @asynccontextmanager
@@ -22,6 +33,7 @@ async def lifespan(app: FastAPI):
         await task
     except (asyncio.CancelledError, Exception):
         pass
+    await live_manager.stop_all()
 
 
 app = FastAPI(
@@ -42,6 +54,9 @@ app.add_middleware(
 
 app.include_router(jobs.router)
 app.include_router(dashboard.router)
+app.include_router(live.router)
+
+app.mount("/live", StaticFiles(directory=settings.live_output_dir), name="live")
 
 
 @app.get("/health", tags=["health"])
