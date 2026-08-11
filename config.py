@@ -13,14 +13,17 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440
 
-    # Direct asyncpg connection (not pooler) for long-running worker.
+    # Direct asyncpg URL (db.*.supabase.co). Prefer pooler_database_url when set.
     # Not required when R2_SCAN_MODE=true.
     database_url: str = ""
+    # Session pooler (IPv4, port 5432) — same as movie-api POOLER_DATABASE_URL /
+    # TRANSCODE_DATABASE_URL. Cuts connection churn vs the direct host.
+    pooler_database_url: str | None = None
 
     # R2-only mode: scan bucket for source.mp4, transcode to HLS, no Supabase writes.
     r2_scan_mode: bool = False
     # Seconds between R2 scans when no work is available.
-    r2_scan_interval: int = 5
+    r2_scan_interval: int = 12
     # Reclaim a stale .transcode.lock after this many seconds.
     r2_lock_timeout_seconds: int = 7200
 
@@ -50,9 +53,14 @@ class Settings(BaseSettings):
     }
 
     # How long to sleep between polling loops (seconds)
-    poll_interval: int = 5
+    poll_interval: int = 12
     # Max concurrent jobs
     max_concurrent: int = 2
+    # Keep the asyncpg pool small — Supabase session pooler has limited slots.
+    db_pool_min_size: int = 1
+    db_pool_max_size: int = 4
+    # Recycle idle connections before the pooler drops them (seconds).
+    db_pool_max_inactive_lifetime: int = 180
 
     # ── Retry / reliability ───────────────────────────────────────────────────
     # Max transcode attempts before a job is marked permanently failed.
@@ -90,10 +98,17 @@ class Settings(BaseSettings):
     # Live overlay forces a video re-encode; keep this fast for low latency.
     live_x264_preset: str = "ultrafast"
 
+    @property
+    def effective_database_url(self) -> str:
+        """Prefer session pooler when set (IPv4 + less direct-host churn)."""
+        return (self.pooler_database_url or self.database_url).strip()
+
     @model_validator(mode="after")
     def _require_database_unless_r2_scan(self) -> "Settings":
-        if not self.r2_scan_mode and not self.database_url.strip():
-            raise ValueError("DATABASE_URL is required unless R2_SCAN_MODE=true")
+        if not self.r2_scan_mode and not self.effective_database_url:
+            raise ValueError(
+                "DATABASE_URL or POOLER_DATABASE_URL is required unless R2_SCAN_MODE=true"
+            )
         return self
 
 

@@ -571,17 +571,17 @@ async def run_worker() -> None:
         return
 
     global pool, worker_ready
-    # asyncpg uses the raw postgresql:// URL (strip the +asyncpg driver prefix)
-    dsn = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
+    # Prefer session pooler (POOLER_DATABASE_URL); asyncpg wants postgresql://
+    dsn = settings.effective_database_url.replace("postgresql+asyncpg://", "postgresql://")
+    max_size = max(settings.db_pool_min_size, min(settings.db_pool_max_size, settings.max_concurrent + 2))
     pool = await asyncpg.create_pool(
         dsn,
-        min_size=2,
-        # max_concurrent job handlers + the claim loop + the reaper, each of
-        # which may briefly hold a connection at the same time.
-        max_size=settings.max_concurrent + 2,
+        min_size=settings.db_pool_min_size,
+        # Cap pool size for Supabase session pooler slot limits.
+        max_size=max_size,
         statement_cache_size=0,
-        # Recycle idle connections every 5 min so the DB server never drops them first
-        max_inactive_connection_lifetime=300,
+        # Recycle idle connections before the pooler drops them
+        max_inactive_connection_lifetime=settings.db_pool_max_inactive_lifetime,
     )
     semaphore = asyncio.Semaphore(settings.max_concurrent)
 
