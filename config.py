@@ -88,8 +88,11 @@ class Settings(BaseSettings):
     # served from (see main.py's /live static mount). Ephemeral by design —
     # live segments aren't meant to persist, so no volume mount is required.
     live_output_dir: str = "/tmp/live"
-    live_hls_segment_time: int = 6
+    # Shorter segments = faster join time on mobile (was 6).
+    live_hls_segment_time: int = 3
     live_hls_list_size: int = 8
+    # Cap encoded live height for faster mobile buffering (logo path re-encodes).
+    live_max_height: int = 720
     # Burned-in watermark on live restreams (top-left). Empty = bundled asset
     # if present, otherwise remux-only with no logo.
     live_logo_path: str = ""

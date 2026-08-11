@@ -61,15 +61,22 @@ def _resolve_logo_path() -> Path | None:
     return _BUNDLED_LOGO if _BUNDLED_LOGO.is_file() else None
 
 
-def _build_cmd(source_url: str, out_dir: Path) -> list[str]:
+def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
+    # Absolute segment URLs so players can hit the origin directly after authorize
+    # (skips the API playlist-rewrite hop).
+    public_base = settings.worker_public_url.strip().rstrip("/")
+    hls_base = f"{public_base}/live/{channel_id}/" if public_base else ""
     hls_args = [
         "-f", "hls",
         "-hls_time", str(settings.live_hls_segment_time),
         "-hls_list_size", str(settings.live_hls_list_size),
         "-hls_flags", "delete_segments+append_list+omit_endlist",
         "-hls_segment_filename", str(out_dir / "seg_%05d.ts"),
-        str(out_dir / "index.m3u8"),
     ]
+    if hls_base:
+        hls_args.extend(["-hls_base_url", hls_base])
+    hls_args.append(str(out_dir / "index.m3u8"))
+
     base = [
         settings.ffmpeg_path,
         "-y",
@@ -85,12 +92,16 @@ def _build_cmd(source_url: str, out_dir: Path) -> list[str]:
         return [*base, "-c", "copy", *hls_args]
 
     # Burn Reeltime logo top-left. Requires video re-encode.
-    # Force yuv420p — logo PNGs promote to yuv444p which browsers show as black.
+    # Cap height for faster mobile join; force yuv420p for browser/ExoPlayer.
+    # Force keyframes on the HLS segment boundary or ffmpeg keeps source GOPs (~10s).
     width = max(32, int(settings.live_logo_width))
     margin = max(0, int(settings.live_logo_margin))
+    max_h = max(360, int(settings.live_max_height))
+    seg = max(1, int(settings.live_hls_segment_time))
     filter_complex = (
+        f"[0:v]scale=-2:'min({max_h},ih)'[base];"
         f"[1:v]scale={width}:-1[lg];"
-        f"[0:v][lg]overlay={margin}:{margin},format=yuv420p"
+        f"[base][lg]overlay={margin}:{margin},format=yuv420p"
     )
     return [
         *base,
@@ -101,6 +112,8 @@ def _build_cmd(source_url: str, out_dir: Path) -> list[str]:
         "-tune", "zerolatency",
         "-pix_fmt", "yuv420p",
         "-profile:v", "high",
+        "-force_key_frames", f"expr:gte(t,n_forced*{seg})",
+        "-sc_threshold", "0",
         "-c:a", "aac",
         "-b:a", "128k",
         "-ac", "2",
@@ -155,7 +168,7 @@ async def start_channel(channel_id: str, source_url: str) -> dict:
 
     hls_url = _hls_url(channel_id)
     process = await asyncio.create_subprocess_exec(
-        *_build_cmd(source_url, out_dir),
+        *_build_cmd(source_url, out_dir, channel_id),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
