@@ -85,11 +85,12 @@ def _build_cmd(source_url: str, out_dir: Path) -> list[str]:
         return [*base, "-c", "copy", *hls_args]
 
     # Burn Reeltime logo top-left. Requires video re-encode.
+    # Force yuv420p — logo PNGs promote to yuv444p which browsers show as black.
     width = max(32, int(settings.live_logo_width))
     margin = max(0, int(settings.live_logo_margin))
     filter_complex = (
         f"[1:v]scale={width}:-1[lg];"
-        f"[0:v][lg]overlay={margin}:{margin}:format=auto"
+        f"[0:v][lg]overlay={margin}:{margin},format=yuv420p"
     )
     return [
         *base,
@@ -98,6 +99,8 @@ def _build_cmd(source_url: str, out_dir: Path) -> list[str]:
         "-c:v", settings.video_codec,
         "-preset", settings.live_x264_preset,
         "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
         "-c:a", "aac",
         "-b:a", "128k",
         "-ac", "2",
