@@ -6,8 +6,8 @@ rolling window of HLS segments to local disk until explicitly stopped.
 Segments are served directly by this service's /live static mount (see
 main.py) — no R2 involved, since live output is ephemeral by nature.
 
-Source is pulled with -c copy (remux only, no re-encode) since the source is
-already an HLS stream — this is a restream, not a transcode.
+When a logo asset is available, video is lightly re-encoded with an overlay
+(top-left). Otherwise we remux with -c copy for minimum CPU.
 """
 
 import asyncio
@@ -21,6 +21,7 @@ from transcode_service.config import settings
 _PLAYLIST_POLL_INTERVAL = 0.5
 _PLAYLIST_WAIT_TIMEOUT = 20  # seconds a channel can sit in "starting" before we give up watching
 _STOP_GRACE_SECONDS = 10  # time to let ffmpeg exit after SIGTERM before SIGKILL
+_BUNDLED_LOGO = Path(__file__).resolve().parent / "assets" / "reeltime_live_logo.png"
 
 
 @dataclass
@@ -52,21 +53,55 @@ def _hls_url(channel_id: str) -> str:
     return f"{base}/live/{channel_id}/index.m3u8"
 
 
+def _resolve_logo_path() -> Path | None:
+    configured = (settings.live_logo_path or "").strip()
+    if configured:
+        path = Path(configured)
+        return path if path.is_file() else None
+    return _BUNDLED_LOGO if _BUNDLED_LOGO.is_file() else None
+
+
 def _build_cmd(source_url: str, out_dir: Path) -> list[str]:
-    return [
-        settings.ffmpeg_path,
-        "-y",
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "5",
-        "-i", source_url,
-        "-c", "copy",
+    hls_args = [
         "-f", "hls",
         "-hls_time", str(settings.live_hls_segment_time),
         "-hls_list_size", str(settings.live_hls_list_size),
         "-hls_flags", "delete_segments+append_list+omit_endlist",
         "-hls_segment_filename", str(out_dir / "seg_%05d.ts"),
         str(out_dir / "index.m3u8"),
+    ]
+    base = [
+        settings.ffmpeg_path,
+        "-y",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-i", source_url,
+    ]
+
+    logo = _resolve_logo_path()
+    if logo is None:
+        # Remux-only — lowest CPU, no watermark.
+        return [*base, "-c", "copy", *hls_args]
+
+    # Burn Reeltime logo top-left. Requires video re-encode.
+    width = max(32, int(settings.live_logo_width))
+    margin = max(0, int(settings.live_logo_margin))
+    filter_complex = (
+        f"[1:v]scale={width}:-1[lg];"
+        f"[0:v][lg]overlay={margin}:{margin}:format=auto"
+    )
+    return [
+        *base,
+        "-i", str(logo),
+        "-filter_complex", filter_complex,
+        "-c:v", settings.video_codec,
+        "-preset", settings.live_x264_preset,
+        "-tune", "zerolatency",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ac", "2",
+        *hls_args,
     ]
 
 

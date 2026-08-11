@@ -82,6 +82,13 @@ class Settings(BaseSettings):
     live_output_dir: str = "/tmp/live"
     live_hls_segment_time: int = 6
     live_hls_list_size: int = 8
+    # Burned-in watermark on live restreams (top-left). Empty = bundled asset
+    # if present, otherwise remux-only with no logo.
+    live_logo_path: str = ""
+    live_logo_width: int = 96
+    live_logo_margin: int = 24
+    # Live overlay forces a video re-encode; keep this fast for low latency.
+    live_x264_preset: str = "ultrafast"
 
     @model_validator(mode="after")
     def _require_database_unless_r2_scan(self) -> "Settings":
