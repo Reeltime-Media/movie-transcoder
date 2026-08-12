@@ -1,4 +1,11 @@
-"""R2-only transcode scan: discover sources, coordinate locks, skip existing HLS."""
+"""R2-only transcode scan: discover sources, coordinate locks, skip existing HLS.
+
+Class A cost rules:
+- Never ListObjects over movies/ or series/ without Delimiter — that walks every
+  HLS .ts segment and was the main Class A bill driver.
+- Prefer HEAD (Class B) to check source.mp4 / master.m3u8 existence.
+- Cache source lists and dashboard inventory; idle workers back off hard.
+"""
 
 from __future__ import annotations
 
@@ -63,16 +70,42 @@ def _object_exists(key: str) -> bool:
         return False
 
 
+def _list_common_prefixes(client, prefix: str) -> list[str]:
+    """List immediate child prefixes only (Delimiter='/') — cheap Class A."""
+    prefixes: list[str] = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(
+        Bucket=settings.r2_bucket_name,
+        Prefix=prefix,
+        Delimiter="/",
+    ):
+        for cp in page.get("CommonPrefixes", []):
+            p = cp.get("Prefix")
+            if p:
+                prefixes.append(p)
+    return prefixes
+
+
 def list_source_keys() -> list[str]:
+    """Discover source.mp4 keys without walking HLS segment trees.
+
+    Uses delimiter listings (folder pages only) + HEAD for source.mp4 (Class B).
+    """
     client = _r2()
     keys: list[str] = []
-    for prefix in ("movies/", "series/"):
-        paginator = client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=settings.r2_bucket_name, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith("/source.mp4"):
-                    keys.append(key)
+
+    for movie_prefix in _list_common_prefixes(client, "movies/"):
+        source_key = f"{movie_prefix}source.mp4"
+        if _object_exists(source_key):
+            keys.append(source_key)
+
+    for series_prefix in _list_common_prefixes(client, "series/"):
+        episodes_root = f"{series_prefix}episodes/"
+        for episode_prefix in _list_common_prefixes(client, episodes_root):
+            source_key = f"{episode_prefix}source.mp4"
+            if _object_exists(source_key):
+                keys.append(source_key)
+
     return sorted(keys)
 
 
@@ -175,6 +208,7 @@ _inventory_cache: dict | None = None
 _inventory_cache_at: float = 0.0
 _source_keys_cache: list[str] | None = None
 _source_keys_cache_at: float = 0.0
+_no_work_until: float = 0.0
 
 # Updated in background — dashboard reads this instantly (never blocks on full scan).
 _dashboard_stats: dict = {
@@ -188,69 +222,45 @@ _dashboard_stats: dict = {
 }
 
 
-def list_source_keys_cached(ttl_seconds: int = 600) -> list[str]:
+def list_source_keys_cached(ttl_seconds: int | None = None) -> list[str]:
     global _source_keys_cache, _source_keys_cache_at
+    ttl = settings.r2_source_list_ttl_seconds if ttl_seconds is None else ttl_seconds
     now = time.time()
-    if _source_keys_cache is not None and now - _source_keys_cache_at < ttl_seconds:
+    if _source_keys_cache is not None and now - _source_keys_cache_at < ttl:
         return _source_keys_cache
     _source_keys_cache = list_source_keys()
     _source_keys_cache_at = now
     return _source_keys_cache
 
 
-def _list_hls_master_keys() -> set[str]:
-    """List all master.m3u8 keys (one paginated pass per prefix, no per-movie HEAD)."""
-    client = _r2()
-    masters: set[str] = set()
-    for prefix in ("movies/", "series/"):
-        paginator = client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=settings.r2_bucket_name, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith("/hls/master.m3u8"):
-                    masters.add(key)
-    return masters
-
-
-def _source_key_from_master(master_key: str) -> str | None:
-    movie = re.fullmatch(r"movies/([^/]+)/hls/master\.m3u8", master_key)
-    if movie:
-        return f"movies/{movie.group(1)}/source.mp4"
-    episode = re.fullmatch(
-        r"series/([^/]+)/episodes/([^/]+)/hls/master\.m3u8",
-        master_key,
-    )
-    if episode:
-        return (
-            f"series/{episode.group(1)}/episodes/{episode.group(2)}/source.mp4"
-        )
-    return None
+def invalidate_source_keys_cache() -> None:
+    global _source_keys_cache, _source_keys_cache_at
+    _source_keys_cache = None
+    _source_keys_cache_at = 0.0
 
 
 def scan_inventory() -> dict:
-    """Full inventory scan (slow — run in background only)."""
+    """Inventory via source discovery + HEAD checks (no full-tree LIST)."""
     sources = list_source_keys_cached()
     done_sources: set[str] = set()
-    for master in _list_hls_master_keys():
-        source = _source_key_from_master(master)
-        if source:
-            done_sources.add(source)
-
     pending: list[str] = []
     failed: list[str] = []
     in_progress: list[str] = []
 
     for source_key in sources:
-        if source_key in done_sources:
+        # Class B HEADs — never list hls/ trees
+        if _object_exists(hls_master_key(source_key)):
+            done_sources.add(source_key)
             continue
         if _object_exists(failed_key(source_key)):
             failed.append(source_key)
             continue
         lk = lock_key(source_key)
-        lock_data = _read_lock(lk) if _object_exists(lk) else None
-        if lock_data and not _lock_is_stale(lock_data):
-            in_progress.append(source_key)
-            continue
+        if _object_exists(lk):
+            lock_data = _read_lock(lk)
+            if lock_data and not _lock_is_stale(lock_data):
+                in_progress.append(source_key)
+                continue
         pending.append(source_key)
 
     return {
@@ -271,7 +281,7 @@ def scan_inventory() -> dict:
 
 def refresh_dashboard_stats() -> dict:
     """Refresh background stats (call from worker thread, not HTTP handler)."""
-    global _dashboard_stats, _inventory_cache, _inventory_cache_at
+    global _dashboard_stats, _inventory_cache, _inventory_cache_at, _no_work_until
     _dashboard_stats = {**_dashboard_stats, "refreshing": True}
     try:
         inv = scan_inventory()
@@ -286,6 +296,8 @@ def refresh_dashboard_stats() -> dict:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "refreshing": False,
         }
+        if not inv["pending"]:
+            _no_work_until = time.time() + settings.r2_idle_backoff_seconds
     except Exception as exc:
         _dashboard_stats = {
             **_dashboard_stats,
@@ -300,23 +312,60 @@ def get_dashboard_stats() -> dict:
     return dict(_dashboard_stats)
 
 
-def scan_inventory_cached(ttl_seconds: int = 120) -> dict:
-    """Legacy cached full scan."""
+def scan_inventory_cached(ttl_seconds: int | None = None) -> dict:
+    """Cached inventory; does not force a refresh on every call."""
     global _inventory_cache, _inventory_cache_at
+    ttl = settings.r2_stats_interval if ttl_seconds is None else ttl_seconds
     now = time.time()
-    if _inventory_cache is not None and now - _inventory_cache_at < ttl_seconds:
+    if _inventory_cache is not None and now - _inventory_cache_at < ttl:
         return _inventory_cache
     return refresh_dashboard_stats() or _inventory_cache or scan_inventory()
 
 
+def _remove_pending(source_key: str) -> None:
+    pending = _dashboard_stats.get("pending")
+    if isinstance(pending, list) and source_key in pending:
+        _dashboard_stats["pending"] = [k for k in pending if k != source_key]
+        counts = dict(_dashboard_stats.get("counts") or {})
+        counts["pending"] = max(0, int(counts.get("pending") or 0) - 1)
+        _dashboard_stats["counts"] = counts
+
+
 def claim_next_source(worker_name: str) -> str | None:
-    """Pick a pending source and try to acquire its lock (fast path, no full inventory)."""
-    sources = list_source_keys_cached()
-    random.shuffle(sources)
-    for source_key in sources:
+    """Pick a pending source and try to acquire its lock.
+
+    Prefers the last inventory pending list so we do not re-HEAD every source
+    every few seconds when the catalog is already complete.
+    """
+    global _no_work_until
+    now = time.time()
+    if now < _no_work_until:
+        return None
+
+    pending = list(_dashboard_stats.get("pending") or [])
+    if pending:
+        candidates = pending
+    else:
+        # No fresh pending list yet — cheap discovery, then HEAD masters (Class B).
+        sources = list_source_keys_cached()
+        candidates = []
+        for source_key in sources:
+            if _object_exists(hls_master_key(source_key)):
+                continue
+            if _object_exists(failed_key(source_key)):
+                continue
+            candidates.append(source_key)
+        if not candidates:
+            _no_work_until = now + settings.r2_idle_backoff_seconds
+            return None
+
+    random.shuffle(candidates)
+    for source_key in candidates:
         if _object_exists(hls_master_key(source_key)):
+            _remove_pending(source_key)
             continue
         if _object_exists(failed_key(source_key)):
+            _remove_pending(source_key)
             continue
         lk = lock_key(source_key)
         if _object_exists(lk):
@@ -324,6 +373,9 @@ def claim_next_source(worker_name: str) -> str | None:
             if lock_data and not _lock_is_stale(lock_data):
                 continue
         if acquire_lock(source_key, worker_name):
+            _remove_pending(source_key)
             print(f"[transcode] claimed {source_key} on {worker_name}")
             return source_key
+
+    _no_work_until = time.time() + settings.r2_idle_backoff_seconds
     return None

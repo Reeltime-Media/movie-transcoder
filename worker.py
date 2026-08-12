@@ -529,7 +529,8 @@ async def run_r2_scan_worker() -> None:
                 )
             except Exception as exc:
                 print(f"[transcode] stats refresh error: {exc}")
-            await asyncio.sleep(90)
+            # Default 30m — inventory uses delimiter LIST + HEAD, not full-tree walks.
+            await asyncio.sleep(max(60, settings.r2_stats_interval))
 
     asyncio.create_task(stats_loop())
     # Prime stats cache immediately

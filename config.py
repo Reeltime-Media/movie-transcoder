@@ -22,8 +22,15 @@ class Settings(BaseSettings):
 
     # R2-only mode: scan bucket for source.mp4, transcode to HLS, no Supabase writes.
     r2_scan_mode: bool = False
-    # Seconds between R2 scans when no work is available.
-    r2_scan_interval: int = 12
+    # Seconds between claim attempts when the worker is free (not a full-bucket LIST).
+    r2_scan_interval: int = 60
+    # How often to refresh dashboard inventory (source discovery + HEAD checks).
+    # Keep this high — inventory no longer needs to walk every HLS segment.
+    r2_stats_interval: int = 1800
+    # Cache TTL for delimiter-based source.mp4 discovery.
+    r2_source_list_ttl_seconds: int = 1800
+    # When pending is empty, stop claim/HEAD churn for this long.
+    r2_idle_backoff_seconds: int = 300
     # Reclaim a stale .transcode.lock after this many seconds.
     r2_lock_timeout_seconds: int = 7200
 
