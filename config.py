@@ -51,8 +51,10 @@ class Settings(BaseSettings):
     hls_segment_time: int = 6
     # Segment upload concurrency to R2
     r2_upload_concurrency: int = 12
-    # Resolution label -> scale filter value
+    # Resolution label -> scale filter value. 4K is encoded only when the
+    # source is already >= 2160p — never upscaled from 1080p.
     renditions: dict[str, str] = {
+        "4k": "3840:2160",
         "1080p": "1920:1080",
         "720p": "1280:720",
         "480p": "854:480",

@@ -108,11 +108,11 @@ def cancel_job(job_id: str) -> bool:
 
 # ── FFmpeg ────────────────────────────────────────────────────────────────────
 
-async def _probe(source: Path) -> tuple[bool, float]:
-    """Return (has_audio, duration_seconds)."""
+async def _probe(source: Path) -> tuple[bool, float, int, int]:
+    """Return (has_audio, duration_seconds, width, height)."""
     proc = await asyncio.create_subprocess_exec(
         settings.ffprobe_path, "-v", "quiet",
-        "-show_entries", "format=duration:stream=codec_type",
+        "-show_entries", "format=duration:stream=codec_type,width,height",
         "-of", "json", str(source),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -120,11 +120,30 @@ async def _probe(source: Path) -> tuple[bool, float]:
     stdout, _ = await proc.communicate()
     try:
         data = json.loads(stdout)
-        has_audio = any(s.get("codec_type") == "audio" for s in data.get("streams", []))
+        streams = data.get("streams") or []
+        has_audio = any(s.get("codec_type") == "audio" for s in streams)
         duration = float(data.get("format", {}).get("duration", 0) or 0)
-        return has_audio, duration
+        video = next((s for s in streams if s.get("codec_type") == "video"), {})
+        width = int(video.get("width") or 0)
+        height = int(video.get("height") or 0)
+        return has_audio, duration, width, height
     except Exception:
-        return False, 0.0
+        return False, 0.0, 0, 0
+
+
+def _renditions_for_source(width: int, height: int) -> list[tuple[str, str]]:
+    """Drop rungs taller/wider than the source so we never upscale (no fake 4K)."""
+    items: list[tuple[str, str]] = []
+    for label, scale in settings.renditions.items():
+        tw, th = (int(p) for p in scale.split(":"))
+        if width > 0 and height > 0 and (th > height + 16 or tw > width + 16):
+            continue
+        items.append((label, scale))
+    if items:
+        return items
+    # Unknown or tiny source: keep the lowest configured rung.
+    last = list(settings.renditions.items())[-1]
+    return [last]
 
 
 def _video_codec_args(index: int) -> list[str]:
@@ -143,13 +162,13 @@ async def _transcode(source: Path, out_dir: Path, job_id: str) -> None:
     """Produce per-rendition HLS streams and a master playlist."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    has_audio, duration = await _probe(source)
+    has_audio, duration, src_w, src_h = await _probe(source)
 
     # Build filter_complex + output map for each rendition
     filter_parts: list[str] = []
     output_args: list[str] = []
     variant_streams: list[str] = []
-    rendition_items = list(settings.renditions.items())
+    rendition_items = _renditions_for_source(src_w, src_h)
     for i, (label, _scale) in enumerate(rendition_items):
         filter_parts.append(f"[split{i}]")
         output_args += [
@@ -224,11 +243,23 @@ async def _transcode(source: Path, out_dir: Path, job_id: str) -> None:
 
 
 def _bandwidth(label: str) -> int:
-    return {"1080p": 5_000_000, "720p": 3_000_000, "480p": 1_500_000, "360p": 800_000}.get(label, 2_000_000)
+    return {
+        "4k": 12_000_000,
+        "1080p": 5_000_000,
+        "720p": 3_000_000,
+        "480p": 1_500_000,
+        "360p": 800_000,
+    }.get(label, 2_000_000)
 
 
 def _bitrate(label: str) -> str:
-    return {"1080p": "5000k", "720p": "3000k", "480p": "1500k", "360p": "800k"}.get(label, "2000k")
+    return {
+        "4k": "12000k",
+        "1080p": "5000k",
+        "720p": "3000k",
+        "480p": "1500k",
+        "360p": "800k",
+    }.get(label, "2000k")
 
 
 # ── DB helpers (asyncpg direct) ───────────────────────────────────────────────
