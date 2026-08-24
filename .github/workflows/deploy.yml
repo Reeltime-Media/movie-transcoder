@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        host_secret: [GCE_HOST_1, GCE_HOST_2, GCE_HOST_3]
+        host_secret: [GCE_HOST_1, GCE_HOST_2, GCE_HOST_3, GCE_HOST_4, GCE_HOST_5, GCE_HOST_6]
     steps:
       - name: Resolve worker host
         id: host
@@ -40,11 +40,17 @@ jobs:
           H1: ${{ secrets.GCE_HOST_1 }}
           H2: ${{ secrets.GCE_HOST_2 }}
           H3: ${{ secrets.GCE_HOST_3 }}
+          H4: ${{ secrets.GCE_HOST_4 }}
+          H5: ${{ secrets.GCE_HOST_5 }}
+          H6: ${{ secrets.GCE_HOST_6 }}
         run: |
           case "${{ matrix.host_secret }}" in
             GCE_HOST_1) HOST="$H1" ;;
             GCE_HOST_2) HOST="$H2" ;;
             GCE_HOST_3) HOST="$H3" ;;
+            GCE_HOST_4) HOST="$H4" ;;
+            GCE_HOST_5) HOST="$H5" ;;
+            GCE_HOST_6) HOST="$H6" ;;
           esac
           if [ -z "$HOST" ]; then
             echo "Skipping — secret ${{ matrix.host_secret }} not set"

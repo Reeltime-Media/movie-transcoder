@@ -245,6 +245,7 @@ async def _transcode(source: Path, out_dir: Path, job_id: str) -> None:
 def _bandwidth(label: str) -> int:
     return {
         "4k": 12_000_000,
+        "2k": 8_000_000,
         "1080p": 5_000_000,
         "720p": 3_000_000,
         "480p": 1_500_000,
@@ -255,6 +256,7 @@ def _bandwidth(label: str) -> int:
 def _bitrate(label: str) -> str:
     return {
         "4k": "12000k",
+        "2k": "8000k",
         "1080p": "5000k",
         "720p": "3000k",
         "480p": "1500k",
