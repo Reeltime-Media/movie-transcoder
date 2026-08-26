@@ -56,7 +56,29 @@ app.include_router(jobs.router)
 app.include_router(dashboard.router)
 app.include_router(live.router)
 
-app.mount("/live", StaticFiles(directory=settings.live_output_dir), name="live")
+class LiveHLSStaticFiles(StaticFiles):
+    """Custom static file server for live HLS streams.
+
+    Forces no-cache for rolling .m3u8 playlists so players always fetch the
+    latest segment list, and sets short public cache for immutable .ts segments.
+    """
+    def is_not_modified(self, response_headers, request_headers) -> bool:
+        return False
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if path.endswith(".m3u8"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        elif path.endswith(".ts"):
+            response.headers["Cache-Control"] = "public, max-age=60"
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+
+
+app.mount("/live", LiveHLSStaticFiles(directory=settings.live_output_dir), name="live")
 
 
 @app.get("/health", tags=["health"])

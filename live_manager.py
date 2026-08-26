@@ -55,6 +55,8 @@ def _hls_url(channel_id: str) -> str:
 
 def _resolve_logo_path() -> Path | None:
     configured = (settings.live_logo_path or "").strip()
+    if configured.lower() == "none":
+        return None
     if configured:
         path = Path(configured)
         return path if path.is_file() else None
@@ -66,70 +68,108 @@ def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
     # (skips the API playlist-rewrite hop).
     public_base = settings.worker_public_url.strip().rstrip("/")
     hls_base = f"{public_base}/live/{channel_id}/" if public_base else ""
+
+    # Essential live HLS muxer flags:
+    # - delete_segments: deletes obsolete segments from disk based on list_size + delete_threshold
+    # - temp_file: writes playlist and segments to temporary files before atomic rename to avoid partial reads
+    # - omit_endlist: no EXT-X-ENDLIST for rolling live sliding window
+    # - independent_segments: adds EXT-X-INDEPENDENT-SEGMENTS for instant decoder synchronization
+    hls_flags = "delete_segments+temp_file+omit_endlist+independent_segments"
     hls_args = [
         "-f", "hls",
         "-hls_time", str(settings.live_hls_segment_time),
         "-hls_list_size", str(settings.live_hls_list_size),
-        "-hls_flags", "delete_segments+append_list+omit_endlist",
+        "-hls_delete_threshold", str(settings.live_delete_threshold),
+        "-hls_flags", hls_flags,
         "-hls_segment_filename", str(out_dir / "seg_%05d.ts"),
     ]
     if hls_base:
         hls_args.extend(["-hls_base_url", hls_base])
     hls_args.append(str(out_dir / "index.m3u8"))
 
-    base = [
-        settings.ffmpeg_path,
-        "-y",
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "5",
-        "-i", source_url,
+    # Fast input analysis and low-latency buffer flags (drastically cuts stream startup time)
+    input_args = [
+        "-analyzeduration", "1000000",
+        "-probesize", "1000000",
+        "-fflags", "+nobuffer+discardcorrupt+genpts",
+        "-rw_timeout", "10000000",
     ]
+    if source_url.startswith("http://") or source_url.startswith("https://"):
+        input_args.extend([
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-multiple_requests", "1",
+        ])
+    input_args.extend(["-i", source_url])
 
     logo = _resolve_logo_path()
     if logo is None:
-        # Remux-only — lowest CPU, no watermark.
-        return [*base, "-c", "copy", *hls_args]
+        # Remux-only — lowest CPU, instant start, no watermark.
+        return [
+            settings.ffmpeg_path,
+            "-y",
+            *input_args,
+            "-c", "copy",
+            *hls_args,
+        ]
 
-    # Burn Reeltime logo top-left. Requires video re-encode.
-    # Cap height for faster mobile join; force yuv420p for browser/ExoPlayer.
-    # Force keyframes on the HLS segment boundary or ffmpeg keeps source GOPs (~10s).
+    # Burn Reeltime logo top-left with hardware/multi-threaded x264 re-encode.
+    # Cap height for fast mobile join; force yuv420p for browser/ExoPlayer compatibility.
+    # Force keyframes on HLS segment boundaries so chunks cut cleanly without delay.
     width = max(32, int(settings.live_logo_width))
     margin = max(0, int(settings.live_logo_margin))
     max_h = max(360, int(settings.live_max_height))
     seg = max(1, int(settings.live_hls_segment_time))
+    gop_size = seg * 30  # approximate 30fps GOP
+
     filter_complex = (
         f"[0:v]scale=-2:'min({max_h},ih)'[base];"
         f"[1:v]scale={width}:-1[lg];"
-        f"[base][lg]overlay={margin}:{margin},format=yuv420p"
+        f"[base][lg]overlay={margin}:{margin}:shortest=1,format=yuv420p"
     )
     return [
-        *base,
+        settings.ffmpeg_path,
+        "-y",
+        "-threads", "0",
+        *input_args,
         "-i", str(logo),
         "-filter_complex", filter_complex,
         "-c:v", settings.video_codec,
         "-preset", settings.live_x264_preset,
         "-tune", "zerolatency",
         "-pix_fmt", "yuv420p",
-        "-profile:v", "high",
+        "-profile:v", "main",
+        "-b:v", settings.live_video_bitrate,
+        "-maxrate", settings.live_maxrate,
+        "-bufsize", settings.live_bufsize,
+        "-g", str(gop_size),
+        "-keyint_min", str(gop_size),
         "-force_key_frames", f"expr:gte(t,n_forced*{seg})",
         "-sc_threshold", "0",
         "-c:a", "aac",
         "-b:a", "128k",
+        "-ar", "44100",
         "-ac", "2",
         *hls_args,
     ]
 
 
 async def _watch_for_playlist(channel: _LiveChannel) -> None:
-    """Flip starting -> live once ffmpeg has actually written the playlist."""
+    """Flip starting -> live once ffmpeg has written the playlist with playable media."""
     playlist = channel.out_dir / "index.m3u8"
     elapsed = 0.0
     while elapsed < _PLAYLIST_WAIT_TIMEOUT:
         if playlist.exists():
-            if channel.status == "starting":
-                channel.status = "live"
-            return
+            try:
+                content = playlist.read_text(encoding="utf-8", errors="ignore")
+                # Ensure at least 1 valid media segment is present in playlist before flipping to live
+                if "#EXTINF:" in content:
+                    if channel.status == "starting":
+                        channel.status = "live"
+                    return
+            except Exception:
+                pass
         await asyncio.sleep(_PLAYLIST_POLL_INTERVAL)
         elapsed += _PLAYLIST_POLL_INTERVAL
 

@@ -98,13 +98,20 @@ class Settings(BaseSettings):
     # served from (see main.py's /live static mount). Ephemeral by design —
     # live segments aren't meant to persist, so no volume mount is required.
     live_output_dir: str = "/tmp/live"
-    # Shorter segments = faster join time on mobile (was 6).
-    live_hls_segment_time: int = 3
-    live_hls_list_size: int = 8
+    # 2s segments = faster initial frame join (~2s) and lower live latency.
+    live_hls_segment_time: int = 2
+    # Rolling playlist window of 6 segments (12 seconds).
+    live_hls_list_size: int = 6
+    # Keep extra segments on disk after sliding off playlist to avoid 404s.
+    live_delete_threshold: int = 3
     # Cap encoded live height for faster mobile buffering (logo path re-encodes).
     live_max_height: int = 720
+    # Bitrate limits for predictable segment sizes and smooth streaming.
+    live_video_bitrate: str = "2000k"
+    live_maxrate: str = "2500k"
+    live_bufsize: str = "4000k"
     # Burned-in watermark on live restreams (top-left). Empty = bundled asset
-    # if present, otherwise remux-only with no logo.
+    # if present, otherwise remux-only with no logo. Set to "none" to disable logo.
     live_logo_path: str = ""
     live_logo_width: int = 96
     live_logo_margin: int = 24
