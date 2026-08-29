@@ -41,8 +41,31 @@ def _r2():
     )
 
 
-def _download(key: str, dest: Path) -> None:
-    _r2().download_file(settings.r2_bucket_name, key, str(dest))
+def _presigned_source_url(source_key: str, expires_in: int) -> str:
+    """A presigned GET URL ffmpeg/ffprobe can read directly over HTTPS —
+    skips downloading the whole source to local disk before transcoding
+    starts, so decode overlaps with transfer instead of waiting on it.
+
+    expires_in must outlive the whole read (ffmpeg keeps hitting this URL
+    for the entire job, not just the first request), so callers should tie
+    it to running_timeout_seconds rather than a fixed guess.
+    """
+    return _r2().generate_presigned_url(
+        "get_object",
+        Params={"Bucket": settings.r2_bucket_name, "Key": source_key},
+        ExpiresIn=expires_in,
+    )
+
+
+# Recover from a transient drop on the R2 HTTP(S) read instead of failing the
+# whole job — the transfer now spans the entire transcode instead of a single
+# upfront download, so it has more time to hit a blip.
+_RECONNECT_ARGS = [
+    "-reconnect", "1",
+    "-reconnect_streamed", "1",
+    "-reconnect_on_network_error", "1",
+    "-reconnect_delay_max", "5",
+]
 
 
 def _hls_prefix_for_source(source_key: str, content_id: uuid.UUID | None = None) -> str:
@@ -53,6 +76,12 @@ def _hls_prefix_for_source(source_key: str, content_id: uuid.UUID | None = None)
         if content_id is not None:
             return f"hls/{content_id}"
         raise
+
+
+# HLS segments are immutable content-addressed-ish filenames; playlists change
+# on re-transcode so keep a short TTL for CDNs / browsers.
+_HLS_SEGMENT_CACHE = "public, max-age=31536000, immutable"
+_HLS_PLAYLIST_CACHE = "public, max-age=60"
 
 
 def _upload_dir(local_dir: Path, prefix: str) -> None:
@@ -69,12 +98,24 @@ def _upload_dir(local_dir: Path, prefix: str) -> None:
     def upload_one(path: Path) -> None:
         relative = path.relative_to(local_dir)
         r2_key = f"{prefix}/{relative}"
-        content_type = "application/x-mpegURL" if path.suffix == ".m3u8" else "video/MP2T"
+        suffix = path.suffix.lower()
+        if suffix == ".m3u8":
+            content_type = "application/vnd.apple.mpegurl"
+            cache_control = _HLS_PLAYLIST_CACHE
+        elif suffix in (".ts", ".m4s"):
+            content_type = "video/mp2t" if suffix == ".ts" else "video/iso.segment"
+            cache_control = _HLS_SEGMENT_CACHE
+        else:
+            content_type = "application/octet-stream"
+            cache_control = _HLS_SEGMENT_CACHE
         client.upload_file(
             str(path),
             settings.r2_bucket_name,
             r2_key,
-            ExtraArgs={"ContentType": content_type},
+            ExtraArgs={
+                "ContentType": content_type,
+                "CacheControl": cache_control,
+            },
             Config=transfer_config,
         )
 
@@ -108,12 +149,13 @@ def cancel_job(job_id: str) -> bool:
 
 # ── FFmpeg ────────────────────────────────────────────────────────────────────
 
-async def _probe(source: Path) -> tuple[bool, float, int, int]:
+async def _probe(source: str) -> tuple[bool, float, int, int]:
     """Return (has_audio, duration_seconds, width, height)."""
     proc = await asyncio.create_subprocess_exec(
         settings.ffprobe_path, "-v", "quiet",
+        *_RECONNECT_ARGS,
         "-show_entries", "format=duration:stream=codec_type,width,height",
-        "-of", "json", str(source),
+        "-of", "json", source,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -158,7 +200,7 @@ def _video_codec_args(index: int) -> list[str]:
     return args
 
 
-async def _transcode(source: Path, out_dir: Path, job_id: str) -> None:
+async def _transcode(source: str, out_dir: Path, job_id: str) -> None:
     """Produce per-rendition HLS streams and a master playlist."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -195,7 +237,8 @@ async def _transcode(source: Path, out_dir: Path, job_id: str) -> None:
     cmd = [
         settings.ffmpeg_path,
         "-threads", "0",
-        "-i", str(source),
+        *_RECONNECT_ARGS,
+        "-i", source,
         "-filter_complex", filter_complex,
         *output_args,
         "-var_stream_map", " ".join(variant_streams),
@@ -420,16 +463,21 @@ def _title_from_source(source_key: str) -> str:
 
 
 async def _run_transcode_pipeline(source_key: str, job_id: str) -> str:
-    """Download, transcode, upload. Returns hls_master_key."""
+    """Transcode straight from R2 (no local download first), then upload.
+    Returns hls_master_key."""
     tmpdir = tempfile.mkdtemp()
     try:
-        source_path = Path(tmpdir) / "source.mp4"
         out_dir = Path(tmpdir) / "hls"
 
-        await asyncio.get_event_loop().run_in_executor(
-            None, _download, source_key, source_path
+        # Margin past the reaper's own timeout so the URL can't expire
+        # mid-job even on the longest-running transcode this worker allows.
+        source_url = await asyncio.get_event_loop().run_in_executor(
+            None,
+            _presigned_source_url,
+            source_key,
+            settings.running_timeout_seconds + 600,
         )
-        await _transcode(source_path, out_dir, job_id)
+        await _transcode(source_url, out_dir, job_id)
         job_progress[job_id] = 100
 
         hls_prefix = _hls_prefix_for_source(source_key)
