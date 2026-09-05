@@ -174,11 +174,16 @@ async def _probe(source: str) -> tuple[bool, float, int, int]:
 
 
 def _renditions_for_source(width: int, height: int) -> list[tuple[str, str]]:
-    """Drop rungs taller/wider than the source so we never upscale (no fake 4K)."""
+    """Drop rungs that would upscale source pixels after letterbox fit.
+
+    With force_original_aspect_ratio=decrease, upscale only happens when the
+    target is larger on *both* axes (portrait sources can still use a 16:9
+    canvas without enlarging pixels).
+    """
     items: list[tuple[str, str]] = []
     for label, scale in settings.renditions.items():
         tw, th = (int(p) for p in scale.split(":"))
-        if width > 0 and height > 0 and (th > height + 16 or tw > width + 16):
+        if width > 0 and height > 0 and tw > width + 16 and th > height + 16:
             continue
         items.append((label, scale))
     if items:
@@ -186,6 +191,15 @@ def _renditions_for_source(width: int, height: int) -> list[tuple[str, str]]:
     # Unknown or tiny source: keep the lowest configured rung.
     last = list(settings.renditions.items())[-1]
     return [last]
+
+
+def _letterbox_filter(split_label: str, scale: str, out_label: str) -> str:
+    """Fit source inside WxH, pad with black — never stretch."""
+    w, h = scale.split(":")
+    return (
+        f"[{split_label}]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[{out_label}]"
+    )
 
 
 def _video_codec_args(index: int) -> list[str]:
@@ -230,7 +244,7 @@ async def _transcode(source: str, out_dir: Path, job_id: str) -> None:
 
     splits = "".join(filter_parts)
     filter_complex = f"[0:v]split={len(rendition_items)}{splits};" + ";".join(
-        f"[split{i}]scale={scale}[out{i}]"
+        _letterbox_filter(f"split{i}", scale, f"out{i}")
         for i, (_label, scale) in enumerate(rendition_items)
     )
 

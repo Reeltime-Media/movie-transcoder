@@ -379,14 +379,25 @@ async def _dashboard_data() -> dict:
 
 class R2RetryBody(BaseModel):
     source_key: str
+    force: bool = False
 
 
-async def _retry_r2_source(source_key: str) -> dict:
+async def _retry_r2_source(source_key: str, *, force: bool = False) -> dict:
+    deleted = 0
+    if force:
+        deleted = r2_scan.delete_hls_output(source_key)
     r2_scan.clear_failed_marker(source_key)
     r2_scan.release_lock(source_key)
     worker_module._r2_attempts.pop(source_key, None)
     worker_module.r2_jobs.pop(source_key, None)
-    return {"source_key": source_key, "status": "queued", "retried": True}
+    r2_scan.invalidate_source_keys_cache()
+    return {
+        "source_key": source_key,
+        "status": "queued",
+        "retried": True,
+        "force": force,
+        "hls_objects_deleted": deleted,
+    }
 
 
 async def _retry_job(job_id: uuid.UUID) -> dict:
@@ -441,7 +452,7 @@ async def dashboard_r2_retry(body: R2RetryBody):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="R2 retry is only available in R2 scan mode",
         )
-    return await _retry_r2_source(body.source_key)
+    return await _retry_r2_source(body.source_key, force=body.force)
 
 
 @router.get("/dashboard", response_class=HTMLResponse)

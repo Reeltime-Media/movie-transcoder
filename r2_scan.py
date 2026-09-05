@@ -62,6 +62,30 @@ def failed_key(source_key: str) -> str:
     return f"{hls_prefix_for_source(source_key)}/{FAILED_NAME}"
 
 
+def delete_hls_output(source_key: str) -> int:
+    """Delete HLS objects under the source's hls/ prefix so it becomes pending again.
+
+    Used for forced re-transcodes (e.g. after fixing letterbox). Returns deleted count.
+    """
+    prefix = f"{hls_prefix_for_source(source_key)}/"
+    client = _r2()
+    deleted = 0
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=settings.r2_bucket_name, Prefix=prefix):
+        objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+        if not objects:
+            continue
+        # delete_objects accepts up to 1000 keys per call
+        for i in range(0, len(objects), 1000):
+            chunk = objects[i : i + 1000]
+            client.delete_objects(
+                Bucket=settings.r2_bucket_name,
+                Delete={"Objects": chunk, "Quiet": True},
+            )
+            deleted += len(chunk)
+    return deleted
+
+
 def _object_exists(key: str) -> bool:
     try:
         _r2().head_object(Bucket=settings.r2_bucket_name, Key=key)
