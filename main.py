@@ -47,7 +47,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -71,10 +71,8 @@ class LiveHLSStaticFiles(StaticFiles):
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
             response.headers["Pragma"] = "no-cache"
             response.headers["Expires"] = "0"
-            response.headers["Access-Control-Allow-Origin"] = "*"
         elif path.endswith(".ts"):
             response.headers["Cache-Control"] = "public, max-age=60"
-            response.headers["Access-Control-Allow-Origin"] = "*"
         return response
 
 
@@ -87,6 +85,7 @@ async def health():
         "status": "ok",
         "worker": "running" if worker_module.worker_ready else "starting",
         "r2_scan_mode": settings.r2_scan_mode,
+        "live_only": settings.live_only,
     }
 
 

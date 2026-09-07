@@ -66,6 +66,8 @@ class Settings(BaseSettings):
     poll_interval: int = 12
     # Max concurrent jobs
     max_concurrent: int = 2
+    # Skip VOD/R2-scan so this process only restreams live TV.
+    live_only: bool = False
     # Keep the asyncpg pool small — Supabase session pooler has limited slots.
     db_pool_min_size: int = 1
     db_pool_max_size: int = 4
@@ -100,19 +102,19 @@ class Settings(BaseSettings):
     live_output_dir: str = "/tmp/live"
     # 2s segments = faster initial frame join (~2s) and lower live latency.
     live_hls_segment_time: int = 2
-    # Rolling playlist window of 6 segments (12 seconds).
-    live_hls_list_size: int = 6
+    # Short window so players join near the live edge (~4–6s) instead of 12s.
+    live_hls_list_size: int = 3
     # Keep extra segments on disk after sliding off playlist to avoid 404s.
-    live_delete_threshold: int = 3
+    live_delete_threshold: int = 2
     # Cap encoded live height for faster mobile buffering (logo path re-encodes).
     live_max_height: int = 720
     # Bitrate limits for predictable segment sizes and smooth streaming.
     live_video_bitrate: str = "2000k"
     live_maxrate: str = "2500k"
     live_bufsize: str = "4000k"
-    # Burned-in watermark on live restreams (top-left). Empty = bundled asset
-    # if present, otherwise remux-only with no logo. Set to "none" to disable logo.
-    live_logo_path: str = ""
+    # Burned-in watermark re-encodes every channel (expensive). Default remux.
+    # Set to a PNG path to overlay; empty still uses the bundled logo if present.
+    live_logo_path: str = "none"
     live_logo_width: int = 96
     live_logo_margin: int = 24
     # Live overlay forces a video re-encode; keep this fast for low latency.

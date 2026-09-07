@@ -662,11 +662,22 @@ async def run_r2_scan_worker() -> None:
 # ── Polling loop ──────────────────────────────────────────────────────────────
 
 async def run_worker() -> None:
+    global pool, worker_ready
+
+    if settings.live_only:
+        worker_ready = True
+        print("[transcode] live-only mode — VOD worker disabled")
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            print("[transcode] live-only worker shutting down")
+        return
+
     if settings.r2_scan_mode:
         await run_r2_scan_worker()
         return
 
-    global pool, worker_ready
     # Prefer session pooler (POOLER_DATABASE_URL); asyncpg wants postgresql://
     dsn = settings.effective_database_url.replace("postgresql+asyncpg://", "postgresql://")
     max_size = max(settings.db_pool_min_size, min(settings.db_pool_max_size, settings.max_concurrent + 2))

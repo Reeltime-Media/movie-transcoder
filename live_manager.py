@@ -74,7 +74,8 @@ def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
     # - temp_file: writes playlist and segments to temporary files before atomic rename to avoid partial reads
     # - omit_endlist: no EXT-X-ENDLIST for rolling live sliding window
     # - independent_segments: adds EXT-X-INDEPENDENT-SEGMENTS for instant decoder synchronization
-    hls_flags = "delete_segments+temp_file+omit_endlist+independent_segments"
+    # split_by_time cannot be combined with independent_segments (ffmpeg disables it).
+    hls_flags = "delete_segments+temp_file+omit_endlist+split_by_time"
     hls_args = [
         "-f", "hls",
         "-hls_time", str(settings.live_hls_segment_time),
@@ -111,6 +112,8 @@ def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
             "-y",
             *input_args,
             "-c", "copy",
+            "-muxdelay", "0",
+            "-muxpreload", "0",
             *hls_args,
         ]
 
@@ -218,8 +221,8 @@ async def start_channel(channel_id: str, source_url: str) -> dict:
     )
     _channels[channel_id] = channel
     channel.monitor_task = asyncio.create_task(_monitor(channel_id))
-
-    return {"status": "starting", "hls_url": hls_url}
+    await _watch_for_playlist(channel)
+    return {"status": channel.status, "hls_url": hls_url}
 
 
 async def stop_channel(channel_id: str) -> dict:
