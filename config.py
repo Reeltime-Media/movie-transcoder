@@ -102,10 +102,10 @@ class Settings(BaseSettings):
     live_output_dir: str = "/tmp/live"
     # 2s segments = faster initial frame join (~2s) and lower live latency.
     live_hls_segment_time: int = 2
-    # Short window so players join near the live edge (~4–6s) instead of 12s.
-    live_hls_list_size: int = 3
+    # Short window so players join near the live edge (~10–12s) without 404s.
+    live_hls_list_size: int = 6
     # Keep extra segments on disk after sliding off playlist to avoid 404s.
-    live_delete_threshold: int = 2
+    live_delete_threshold: int = 3
     # Cap encoded live height for faster mobile buffering (logo path re-encodes).
     live_max_height: int = 720
     # Bitrate limits for predictable segment sizes and smooth streaming.

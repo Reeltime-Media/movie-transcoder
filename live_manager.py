@@ -21,7 +21,15 @@ from transcode_service.config import settings
 _PLAYLIST_POLL_INTERVAL = 0.5
 _PLAYLIST_WAIT_TIMEOUT = 20  # seconds a channel can sit in "starting" before we give up watching
 _STOP_GRACE_SECONDS = 10  # time to let ffmpeg exit after SIGTERM before SIGKILL
+_MAX_FFMPEG_RESTARTS = 5
 _BUNDLED_LOGO = Path(__file__).resolve().parent / "assets" / "reeltime_live_logo.png"
+
+
+def ffmpeg_restart_delay_seconds(restart_count: int) -> float | None:
+    """Backoff before respawning ffmpeg, or None after too many crashes."""
+    if restart_count >= _MAX_FFMPEG_RESTARTS:
+        return None
+    return float(min(30, 2**restart_count))
 
 
 @dataclass
@@ -33,6 +41,7 @@ class _LiveChannel:
     status: str = "starting"  # starting | live | offline | error
     error: str | None = None
     stopping: bool = False
+    restarts: int = 0
     log_lines: deque = field(default_factory=lambda: deque(maxlen=40))
     monitor_task: "asyncio.Task | None" = None
 
@@ -158,6 +167,16 @@ def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
     ]
 
 
+async def _spawn_ffmpeg(
+    channel_id: str, source_url: str, out_dir: Path
+) -> asyncio.subprocess.Process:
+    return await asyncio.create_subprocess_exec(
+        *_build_cmd(source_url, out_dir, channel_id),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+
 async def _watch_for_playlist(channel: _LiveChannel) -> None:
     """Flip starting -> live once ffmpeg has written the playlist with playable media."""
     playlist = channel.out_dir / "index.m3u8"
@@ -177,6 +196,37 @@ async def _watch_for_playlist(channel: _LiveChannel) -> None:
         elapsed += _PLAYLIST_POLL_INTERVAL
 
 
+async def _respawn_channel(channel_id: str) -> None:
+    """Restart ffmpeg after an unexpected exit, with backoff."""
+    channel = _channels.get(channel_id)
+    if not channel or channel.stopping:
+        return
+    delay = ffmpeg_restart_delay_seconds(channel.restarts)
+    if delay is None:
+        channel.status = "error"
+        channel.error = "ffmpeg exited repeatedly"
+        print(f"[live] giving up on {channel_id} after {_MAX_FFMPEG_RESTARTS} restarts")
+        return
+    channel.restarts += 1
+    print(
+        f"[live] ffmpeg died for {channel_id}; restart "
+        f"{channel.restarts}/{_MAX_FFMPEG_RESTARTS} in {delay:.0f}s"
+    )
+    await asyncio.sleep(delay)
+    if _channels.get(channel_id) is not channel or channel.stopping:
+        return
+
+    shutil.rmtree(channel.out_dir, ignore_errors=True)
+    channel.out_dir.mkdir(parents=True, exist_ok=True)
+    channel.status = "starting"
+    channel.error = None
+    channel.process = await _spawn_ffmpeg(
+        channel_id, channel.source_url, channel.out_dir
+    )
+    channel.monitor_task = asyncio.create_task(_monitor(channel_id))
+    await _watch_for_playlist(channel)
+
+
 async def _monitor(channel_id: str) -> None:
     """Drain ffmpeg's stderr for diagnostics and detect when it exits."""
     channel = _channels[channel_id]
@@ -193,9 +243,11 @@ async def _monitor(channel_id: str) -> None:
     if channel.stopping:
         channel.status = "offline"
         channel.error = None
-    else:
-        channel.status = "error"
-        channel.error = "\n".join(channel.log_lines) or "ffmpeg exited unexpectedly"
+        return
+
+    channel.status = "error"
+    channel.error = "\n".join(channel.log_lines) or "ffmpeg exited unexpectedly"
+    await _respawn_channel(channel_id)
 
 
 async def start_channel(channel_id: str, source_url: str) -> dict:
@@ -210,11 +262,7 @@ async def start_channel(channel_id: str, source_url: str) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     hls_url = _hls_url(channel_id)
-    process = await asyncio.create_subprocess_exec(
-        *_build_cmd(source_url, out_dir, channel_id),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    process = await _spawn_ffmpeg(channel_id, source_url, out_dir)
 
     channel = _LiveChannel(
         process=process, out_dir=out_dir, hls_url=hls_url, source_url=source_url
