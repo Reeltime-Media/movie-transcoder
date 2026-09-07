@@ -108,8 +108,13 @@ def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
         input_args.extend([
             "-reconnect", "1",
             "-reconnect_streamed", "1",
+            "-reconnect_on_network_error", "1",
             "-reconnect_delay_max", "5",
             "-multiple_requests", "1",
+            # Malimar (and similar CDNs) serve segments as extensionless URLs
+            # like ".../me". ffmpeg 6+ rejects those unless we allow ALL.
+            "-allowed_extensions", "ALL",
+            "-allowed_segment_extensions", "ALL",
         ])
     input_args.extend(["-i", source_url])
 
@@ -189,6 +194,8 @@ async def _watch_for_playlist(channel: _LiveChannel) -> None:
                 if "#EXTINF:" in content:
                     if channel.status == "starting":
                         channel.status = "live"
+                    # Recovered — allow a fresh burst of retries if ffmpeg dies later.
+                    channel.restarts = 0
                     return
             except Exception:
                 pass
@@ -245,8 +252,13 @@ async def _monitor(channel_id: str) -> None:
         channel.error = None
         return
 
+    # A newer start_channel() replaced this object — do not rmtree its output.
+    if _channels.get(channel_id) is not channel:
+        return
+
     channel.status = "error"
     channel.error = "\n".join(channel.log_lines) or "ffmpeg exited unexpectedly"
+    print(f"[live] ffmpeg exited for {channel_id}: {channel.error[-400:]}")
     await _respawn_channel(channel_id)
 
 
@@ -256,6 +268,9 @@ async def start_channel(channel_id: str, source_url: str) -> dict:
         if existing.source_url == source_url:
             return {"status": existing.status, "hls_url": existing.hls_url}
         await stop_channel(channel_id)
+    elif existing:
+        # Process already exited; stop the old monitor from respawning into us.
+        existing.stopping = True
 
     out_dir = _out_dir(channel_id)
     shutil.rmtree(out_dir, ignore_errors=True)
