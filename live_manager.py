@@ -21,15 +21,19 @@ from transcode_service.config import settings
 _PLAYLIST_POLL_INTERVAL = 0.5
 _PLAYLIST_WAIT_TIMEOUT = 20  # seconds a channel can sit in "starting" before we give up watching
 _STOP_GRACE_SECONDS = 10  # time to let ffmpeg exit after SIGTERM before SIGKILL
-_MAX_FFMPEG_RESTARTS = 5
 _BUNDLED_LOGO = Path(__file__).resolve().parent / "assets" / "reeltime_live_logo.png"
 
 
-def ffmpeg_restart_delay_seconds(restart_count: int) -> float | None:
-    """Backoff before respawning ffmpeg, or None after too many crashes."""
-    if restart_count >= _MAX_FFMPEG_RESTARTS:
-        return None
+def ffmpeg_restart_delay_seconds(restart_count: int) -> float:
+    """Backoff before respawning ffmpeg. Never gives up — published channels stay up."""
     return float(min(30, 2**restart_count))
+
+
+def prepare_output_dir(out_dir: Path, *, wipe: bool) -> None:
+    """Create the HLS output dir. Wipe only on a deliberate start/stop, not a crash."""
+    if wipe:
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
@@ -182,23 +186,31 @@ async def _spawn_ffmpeg(
     )
 
 
-async def _watch_for_playlist(channel: _LiveChannel) -> None:
-    """Flip starting -> live once ffmpeg has written the playlist with playable media."""
+def _playlist_text(playlist: Path) -> str:
+    try:
+        return playlist.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+async def _watch_for_playlist(
+    channel: _LiveChannel, *, stale_fingerprint: str | None = None
+) -> None:
+    """Flip starting -> live once ffmpeg has written a playable playlist.
+
+    On crash-restart we keep the previous playlist on disk so players do not
+    404. Ignore that stale copy until ffmpeg writes new contents.
+    """
     playlist = channel.out_dir / "index.m3u8"
     elapsed = 0.0
     while elapsed < _PLAYLIST_WAIT_TIMEOUT:
-        if playlist.exists():
-            try:
-                content = playlist.read_text(encoding="utf-8", errors="ignore")
-                # Ensure at least 1 valid media segment is present in playlist before flipping to live
-                if "#EXTINF:" in content:
-                    if channel.status == "starting":
-                        channel.status = "live"
-                    # Recovered — allow a fresh burst of retries if ffmpeg dies later.
-                    channel.restarts = 0
-                    return
-            except Exception:
-                pass
+        content = _playlist_text(playlist)
+        if "#EXTINF:" in content and content != stale_fingerprint:
+            if channel.status == "starting":
+                channel.status = "live"
+            # Recovered — allow a fresh burst of retries if ffmpeg dies later.
+            channel.restarts = 0
+            return
         await asyncio.sleep(_PLAYLIST_POLL_INTERVAL)
         elapsed += _PLAYLIST_POLL_INTERVAL
 
@@ -209,29 +221,23 @@ async def _respawn_channel(channel_id: str) -> None:
     if not channel or channel.stopping:
         return
     delay = ffmpeg_restart_delay_seconds(channel.restarts)
-    if delay is None:
-        channel.status = "error"
-        channel.error = "ffmpeg exited repeatedly"
-        print(f"[live] giving up on {channel_id} after {_MAX_FFMPEG_RESTARTS} restarts")
-        return
     channel.restarts += 1
-    print(
-        f"[live] ffmpeg died for {channel_id}; restart "
-        f"{channel.restarts}/{_MAX_FFMPEG_RESTARTS} in {delay:.0f}s"
-    )
+    print(f"[live] ffmpeg died for {channel_id}; restart {channel.restarts} in {delay:.0f}s")
     await asyncio.sleep(delay)
     if _channels.get(channel_id) is not channel or channel.stopping:
         return
 
-    shutil.rmtree(channel.out_dir, ignore_errors=True)
-    channel.out_dir.mkdir(parents=True, exist_ok=True)
-    channel.status = "starting"
+    stale = _playlist_text(channel.out_dir / "index.m3u8") or None
+    prepare_output_dir(channel.out_dir, wipe=False)
+    # Keep serving the last playlist while ffmpeg comes back.
+    if not stale:
+        channel.status = "starting"
     channel.error = None
     channel.process = await _spawn_ffmpeg(
         channel_id, channel.source_url, channel.out_dir
     )
     channel.monitor_task = asyncio.create_task(_monitor(channel_id))
-    await _watch_for_playlist(channel)
+    await _watch_for_playlist(channel, stale_fingerprint=stale)
 
 
 async def _monitor(channel_id: str) -> None:
@@ -252,11 +258,10 @@ async def _monitor(channel_id: str) -> None:
         channel.error = None
         return
 
-    # A newer start_channel() replaced this object — do not rmtree its output.
+    # A newer start_channel() replaced this object — do not touch its output.
     if _channels.get(channel_id) is not channel:
         return
 
-    channel.status = "error"
     channel.error = "\n".join(channel.log_lines) or "ffmpeg exited unexpectedly"
     print(f"[live] ffmpeg exited for {channel_id}: {channel.error[-400:]}")
     await _respawn_channel(channel_id)
@@ -273,8 +278,7 @@ async def start_channel(channel_id: str, source_url: str) -> dict:
         existing.stopping = True
 
     out_dir = _out_dir(channel_id)
-    shutil.rmtree(out_dir, ignore_errors=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_dir(out_dir, wipe=True)
 
     hls_url = _hls_url(channel_id)
     process = await _spawn_ffmpeg(channel_id, source_url, out_dir)
