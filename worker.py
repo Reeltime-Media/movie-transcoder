@@ -382,6 +382,54 @@ async def _mark_failed(conn, job_id: uuid.UUID, content_id: uuid.UUID, error: st
     """, content_id)
 
 
+def _slug_from_source(source_key: str) -> str | None:
+    """Map an R2 source key to the content row's `slug` column.
+
+    Movies: movies/{slug}/source.mp4 -> slug.
+    Episodes: series/{series_slug}/episodes/{episode_slug}/source.mp4 -> episode_slug
+    (each episode is its own `content` row with its own slug).
+    """
+    movie_match = r2_scan.MOVIE_SOURCE.match(source_key)
+    if movie_match:
+        return movie_match.group(1)
+    episode_match = r2_scan.EPISODE_SOURCE.match(source_key)
+    if episode_match:
+        return episode_match.group(2)
+    return None
+
+
+async def _r2_mark_content_ready(slug: str, hls_master_key: str) -> None:
+    """R2-scan-mode counterpart to `_mark_success` — no `transcode_jobs` row
+    exists in this mode, so only `content` needs updating."""
+    dsn = settings.effective_database_url.replace("postgresql+asyncpg://", "postgresql://")
+    conn = await asyncpg.connect(dsn, statement_cache_size=0)
+    try:
+        await conn.execute(
+            """
+            UPDATE content
+            SET hls_master_key = $1, transcode_status = 'ready', updated_at = now()
+            WHERE slug = $2
+            """,
+            hls_master_key,
+            slug,
+        )
+    finally:
+        await conn.close()
+
+
+async def _r2_mark_content_failed(slug: str) -> None:
+    """R2-scan-mode counterpart to `_mark_failed`, for a permanent failure."""
+    dsn = settings.effective_database_url.replace("postgresql+asyncpg://", "postgresql://")
+    conn = await asyncpg.connect(dsn, statement_cache_size=0)
+    try:
+        await conn.execute(
+            "UPDATE content SET transcode_status = 'failed', updated_at = now() WHERE slug = $1",
+            slug,
+        )
+    finally:
+        await conn.close()
+
+
 async def _requeue(conn, job_id: uuid.UUID, error: str) -> None:
     """Put a failed-but-retryable job back on the queue.
 
@@ -504,7 +552,14 @@ async def _run_transcode_pipeline(source_key: str, job_id: str) -> str:
 
 
 async def process_r2_source(source_key: str) -> None:
-    """Transcode one R2 object without touching Supabase."""
+    """Transcode one R2 object.
+
+    No `transcode_jobs` row exists in this mode (locking/attempts live in R2
+    lock objects instead), but `content.transcode_status`/`hls_master_key`
+    still need updating on success or permanent failure — same as
+    process_job's _mark_success/_mark_failed, just addressed by slug instead
+    of content_id since we never loaded a job row here.
+    """
     job_id = source_key
     attempts = _r2_attempts.get(source_key, 0) + 1
     _r2_attempts[source_key] = attempts
@@ -530,6 +585,22 @@ async def process_r2_source(source_key: str) -> None:
             "error": None,
         }
         print(f"[transcode] r2 {source_key} -> success")
+
+        slug = _slug_from_source(source_key)
+        if slug:
+            try:
+                await _r2_mark_content_ready(slug, hls_master_key)
+            except Exception as db_exc:
+                # The video is genuinely done in R2 — don't turn a DB hiccup
+                # into a wasted re-transcode. Loudly logged since this is
+                # exactly the kind of drift that silently strands content.
+                print(
+                    f"[transcode] r2 {source_key} -> transcode succeeded but "
+                    f"failed to update content.transcode_status for slug "
+                    f"'{slug}': {db_exc}"
+                )
+        else:
+            print(f"[transcode] r2 {source_key} -> could not derive slug, content row not updated")
     except Exception as exc:
         jid = job_id
         if jid in _cancelled:
@@ -554,6 +625,15 @@ async def process_r2_source(source_key: str) -> None:
         if not retryable or attempts >= settings.max_attempts:
             r2_scan.write_failed_marker(source_key, error_msg, attempts)
             print(f"[transcode] r2 {source_key} -> failed permanently: {error_msg}")
+            slug = _slug_from_source(source_key)
+            if slug:
+                try:
+                    await _r2_mark_content_failed(slug)
+                except Exception as db_exc:
+                    print(
+                        f"[transcode] r2 {source_key} -> failed to update "
+                        f"content.transcode_status='failed' for slug '{slug}': {db_exc}"
+                    )
         else:
             print(
                 f"[transcode] r2 {source_key} -> failed "
