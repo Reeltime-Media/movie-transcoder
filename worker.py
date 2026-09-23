@@ -250,7 +250,7 @@ async def _transcode(source: str, out_dir: Path, job_id: str) -> None:
 
     cmd = [
         settings.ffmpeg_path,
-        "-threads", "0",
+        "-threads", str(settings.ffmpeg_threads),
         *_RECONNECT_ARGS,
         "-i", source,
         "-filter_complex", filter_complex,

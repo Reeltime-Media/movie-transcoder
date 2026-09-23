@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # FFmpeg
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
+    # 0 = ffmpeg picks (usually all cores). Cap this when running multiple
+    # worker instances on one box so they don't starve each other.
+    ffmpeg_threads: int = 0
     # "libx264" (CPU), "h264_nvenc", "h264_qsv", "h264_vaapi", etc.
     video_codec: str = "libx264"
     # Used for software x264 encodes (e.g. ultrafast, superfast, veryfast, faster)
