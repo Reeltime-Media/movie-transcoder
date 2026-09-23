@@ -74,27 +74,44 @@ done
 echo "==> Copying .env to the VM"
 gcloud compute scp "$ENV_FILE" "$INSTANCE_NAME:~/transcoder.env" --zone="$ZONE" --quiet
 
-echo "==> Installing Docker, cloning repo, building and starting the container"
+echo "==> Kicking off install/build/run on the VM in the background"
 gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --quiet --command="
-  set -e
-  if ! command -v docker &>/dev/null; then
-    sudo apt-get update -y
-    sudo apt-get install -y docker.io git
-    sudo systemctl enable --now docker
-  fi
-  if [ -d app ]; then
-    (cd app && sudo git pull)
-  else
-    sudo git clone '$REPO_URL' app
-  fi
-  sudo docker build -t movie-transcoder ./app
-  sudo docker rm -f transcoder 2>/dev/null || true
-  sudo docker run -d --name transcoder --env-file ~/transcoder.env -p ${PORT}:${PORT} --restart unless-stopped movie-transcoder
+  rm -f ~/deploy.log
+  nohup bash -c '
+    set -e
+    if ! command -v docker &>/dev/null; then
+      sudo apt-get update -y
+      sudo apt-get install -y docker.io git
+      sudo systemctl enable --now docker
+    fi
+    if [ -d ~/app ]; then
+      (cd ~/app && sudo git pull)
+    else
+      sudo git clone \"$REPO_URL\" ~/app
+    fi
+    sudo docker build -t movie-transcoder ~/app
+    sudo docker rm -f transcoder 2>/dev/null || true
+    sudo docker run -d --name transcoder --env-file ~/transcoder.env -p ${PORT}:${PORT} --restart unless-stopped movie-transcoder
+  ' > ~/deploy.log 2>&1 < /dev/null &
+  disown
+  echo started
 "
+
+echo "==> Polling for the container to come up (this can take a few minutes, output stays on the VM)"
+for i in $(seq 1 60); do
+  STATUS=$(gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --quiet --command="sudo docker ps --filter name=transcoder --format '{{.Status}}' 2>/dev/null" 2>/dev/null || true)
+  if [[ -n "$STATUS" ]]; then
+    echo "    container is up: $STATUS"
+    break
+  fi
+  echo "    still building/starting... ($i/60) - tail: $(gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --quiet --command="tail -n 1 ~/deploy.log 2>/dev/null" 2>/dev/null || true)"
+  sleep 15
+done
 
 EXTERNAL_IP=$(gcloud compute instances describe "$INSTANCE_NAME" --zone="$ZONE" --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
 
 echo ""
 echo "=================================================="
 echo " Transcoder hosted at: http://${EXTERNAL_IP}:${PORT}"
+echo " Full remote build log: ~/deploy.log on the VM"
 echo "=================================================="
