@@ -110,6 +110,21 @@ def _list_common_prefixes(client, prefix: str) -> list[str]:
     return prefixes
 
 
+def list_episode_sources_for_series(series_slug: str) -> list[str]:
+    """Cheap Class A listing of source.mp4 keys for one series slug."""
+    slug = series_slug.strip().strip("/")
+    if not slug:
+        return []
+    client = _r2()
+    episodes_root = f"series/{slug}/episodes/"
+    keys: list[str] = []
+    for episode_prefix in _list_common_prefixes(client, episodes_root):
+        source_key = f"{episode_prefix}source.mp4"
+        if _object_exists(source_key):
+            keys.append(source_key)
+    return sorted(keys)
+
+
 def list_source_keys() -> list[str]:
     """Discover source.mp4 keys without walking HLS segment trees.
 

@@ -287,9 +287,10 @@ async def _transcode(source: str, out_dir: Path, job_id: str) -> None:
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed:\n" + "\n".join(stderr_lines[-60:]))
 
-    # Write master playlist
+    # Lowest bandwidth first. Native HLS starts on the first STREAM-INF,
+    # so listing 4K first made phones buffer a huge segment before playback.
     master_lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
-    for i, (label, scale) in enumerate(rendition_items):
+    for label, scale in reversed(rendition_items):
         w, h = scale.split(":")
         master_lines.append(
             f'#EXT-X-STREAM-INF:BANDWIDTH={_bandwidth(label)},RESOLUTION={w}x{h}'

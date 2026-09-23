@@ -106,19 +106,24 @@ class Settings(BaseSettings):
     live_hls_list_size: int = 6
     # Keep extra segments on disk after sliding off playlist to avoid 404s.
     live_delete_threshold: int = 3
-    # Cap encoded live height for faster mobile buffering (logo path re-encodes).
+    # Cap encoded live height so first segments stay small on mobile.
     live_max_height: int = 720
     # Bitrate limits for predictable segment sizes and smooth streaming.
+    # Keep bufsize ~0.5s of bitrate so the encoder does not add 2s of VBV delay.
     live_video_bitrate: str = "2000k"
-    live_maxrate: str = "2500k"
-    live_bufsize: str = "4000k"
-    # Burned-in watermark re-encodes every channel (expensive). Default remux.
-    # Set to a PNG path to overlay; empty still uses the bundled logo if present.
+    live_maxrate: str = "2200k"
+    live_bufsize: str = "1000k"
+    # Default re-encodes to 720p / 2s IDR so phones can start on the first
+    # independent segment. Set true to remux (-c copy) if the live VM is CPU-bound.
+    live_copy: bool = False
+    # PNG overlay; "none" disables it. Empty uses the bundled logo if present.
     live_logo_path: str = "none"
     live_logo_width: int = 96
     live_logo_margin: int = 24
     # Live overlay forces a video re-encode; keep this fast for low latency.
     live_x264_preset: str = "ultrafast"
+    # One thread per channel so 20+ live encodes do not oversubscribe the VM.
+    live_encode_threads: int = 1
 
     @property
     def effective_database_url(self) -> str:

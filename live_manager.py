@@ -6,8 +6,9 @@ rolling window of HLS segments to local disk until explicitly stopped.
 Segments are served directly by this service's /live static mount (see
 main.py) — no R2 involved, since live output is ephemeral by nature.
 
-When a logo asset is available, video is lightly re-encoded with an overlay
-(top-left). Otherwise we remux with -c copy for minimum CPU.
+By default each channel is re-encoded to 720p with 2s IDR keyframes so every
+HLS segment is independently decodable and phones can start on the first
+chunk. Set LIVE_COPY=true to remux (-c copy) if the live VM is CPU-bound.
 """
 
 import asyncio
@@ -76,36 +77,48 @@ def _resolve_logo_path() -> Path | None:
     return _BUNDLED_LOGO if _BUNDLED_LOGO.is_file() else None
 
 
+def _hls_flags(*, copy_mode: bool) -> str:
+    # copy mode cannot guarantee IDR-aligned cuts, so split_by_time is required.
+    # Re-encode mode forces a keyframe per segment and can advertise
+    # independent_segments so players decode the first chunk they download.
+    flags = [
+        "delete_segments",
+        "temp_file",
+        "omit_endlist",
+        "program_date_time",
+        "split_by_time" if copy_mode else "independent_segments",
+    ]
+    return "+".join(flags)
+
+
 def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
     # Absolute segment URLs so players can hit the origin directly after authorize
     # (skips the API playlist-rewrite hop).
     public_base = settings.worker_public_url.strip().rstrip("/")
     hls_base = f"{public_base}/live/{channel_id}/" if public_base else ""
+    logo = _resolve_logo_path()
+    copy_mode = logo is None and bool(settings.live_copy)
 
-    # Essential live HLS muxer flags:
-    # - delete_segments: deletes obsolete segments from disk based on list_size + delete_threshold
-    # - temp_file: writes playlist and segments to temporary files before atomic rename to avoid partial reads
-    # - omit_endlist: no EXT-X-ENDLIST for rolling live sliding window
-    # - independent_segments: adds EXT-X-INDEPENDENT-SEGMENTS for instant decoder synchronization
-    # split_by_time cannot be combined with independent_segments (ffmpeg disables it).
-    hls_flags = "delete_segments+temp_file+omit_endlist+split_by_time"
     hls_args = [
         "-f", "hls",
         "-hls_time", str(settings.live_hls_segment_time),
         "-hls_list_size", str(settings.live_hls_list_size),
         "-hls_delete_threshold", str(settings.live_delete_threshold),
-        "-hls_flags", hls_flags,
+        "-hls_flags", _hls_flags(copy_mode=copy_mode),
         "-hls_segment_filename", str(out_dir / "seg_%05d.ts"),
+        "-flush_packets", "1",
+        "-muxdelay", "0",
+        "-muxpreload", "0",
     ]
     if hls_base:
         hls_args.extend(["-hls_base_url", hls_base])
     hls_args.append(str(out_dir / "index.m3u8"))
 
-    # Fast input analysis and low-latency buffer flags (drastically cuts stream startup time)
     input_args = [
         "-analyzeduration", "1000000",
         "-probesize", "1000000",
         "-fflags", "+nobuffer+discardcorrupt+genpts",
+        "-flags", "+low_delay",
         "-rw_timeout", "10000000",
     ]
     if source_url.startswith("http://") or source_url.startswith("https://"):
@@ -115,6 +128,9 @@ def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
             "-reconnect_on_network_error", "1",
             "-reconnect_delay_max", "5",
             "-multiple_requests", "1",
+            # Join the source at the live edge instead of transcoding the
+            # last 3 source segments (ffmpeg HLS demuxer default -3).
+            "-live_start_index", "-1",
             # Malimar (and similar CDNs) serve segments as extensionless URLs
             # like ".../me". ffmpeg 6+ rejects those unless we allow ALL.
             "-allowed_extensions", "ALL",
@@ -122,40 +138,22 @@ def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
         ])
     input_args.extend(["-i", source_url])
 
-    logo = _resolve_logo_path()
-    if logo is None:
-        # Remux-only — lowest CPU, instant start, no watermark.
+    if copy_mode:
         return [
             settings.ffmpeg_path,
             "-y",
             *input_args,
             "-c", "copy",
-            "-muxdelay", "0",
-            "-muxpreload", "0",
             *hls_args,
         ]
 
-    # Burn Reeltime logo top-left with hardware/multi-threaded x264 re-encode.
-    # Cap height for fast mobile join; force yuv420p for browser/ExoPlayer compatibility.
-    # Force keyframes on HLS segment boundaries so chunks cut cleanly without delay.
     width = max(32, int(settings.live_logo_width))
     margin = max(0, int(settings.live_logo_margin))
     max_h = max(360, int(settings.live_max_height))
     seg = max(1, int(settings.live_hls_segment_time))
-    gop_size = seg * 30  # approximate 30fps GOP
+    gop_size = seg * 30  # approximate 30fps GOP aligned to hls_time
 
-    filter_complex = (
-        f"[0:v]scale=-2:'min({max_h},ih)'[base];"
-        f"[1:v]scale={width}:-1[lg];"
-        f"[base][lg]overlay={margin}:{margin}:shortest=1,format=yuv420p"
-    )
-    return [
-        settings.ffmpeg_path,
-        "-y",
-        "-threads", "0",
-        *input_args,
-        "-i", str(logo),
-        "-filter_complex", filter_complex,
+    encode_args = [
         "-c:v", settings.video_codec,
         "-preset", settings.live_x264_preset,
         "-tune", "zerolatency",
@@ -169,9 +167,36 @@ def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
         "-force_key_frames", f"expr:gte(t,n_forced*{seg})",
         "-sc_threshold", "0",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "96k",
         "-ar", "44100",
         "-ac", "2",
+    ]
+
+    if logo is None:
+        vf = f"scale=-2:'min({max_h},ih)',format=yuv420p"
+        return [
+            settings.ffmpeg_path,
+            "-y",
+            "-threads", str(max(1, int(settings.live_encode_threads))),
+            *input_args,
+            "-vf", vf,
+            *encode_args,
+            *hls_args,
+        ]
+
+    filter_complex = (
+        f"[0:v]scale=-2:'min({max_h},ih)'[base];"
+        f"[1:v]scale={width}:-1[lg];"
+        f"[base][lg]overlay={margin}:{margin}:shortest=1,format=yuv420p"
+    )
+    return [
+        settings.ffmpeg_path,
+        "-y",
+        "-threads", str(max(1, int(settings.live_encode_threads))),
+        *input_args,
+        "-i", str(logo),
+        "-filter_complex", filter_complex,
+        *encode_args,
         *hls_args,
     ]
 
