@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     db_pool_min_size: int = 1
     db_pool_max_size: int = 4
     # Recycle idle connections before the pooler drops them (seconds).
-    db_pool_max_inactive_lifetime: int = 180
+    db_pool_max_inactive_lifetime: int = 600
 
     # ── Retry / reliability ───────────────────────────────────────────────────
     # Max transcode attempts before a job is marked permanently failed.

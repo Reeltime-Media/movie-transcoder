@@ -27,6 +27,9 @@ from boto3.s3.transfer import TransferConfig
 from transcode_service.config import settings
 from transcode_service import r2_scan
 
+pool: asyncpg.Pool | None = None
+worker_ready: bool = False
+
 
 # ── R2 helpers ────────────────────────────────────────────────────────────────
 
@@ -402,6 +405,19 @@ def _slug_from_source(source_key: str) -> str | None:
 async def _r2_mark_content_ready(slug: str, hls_master_key: str) -> None:
     """R2-scan-mode counterpart to `_mark_success` — no `transcode_jobs` row
     exists in this mode, so only `content` needs updating."""
+    if pool is not None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE content
+                SET hls_master_key = $1, transcode_status = 'ready', updated_at = now()
+                WHERE slug = $2
+                """,
+                hls_master_key,
+                slug,
+            )
+        return
+
     dsn = settings.effective_database_url.replace("postgresql+asyncpg://", "postgresql://")
     conn = await asyncpg.connect(dsn, statement_cache_size=0)
     try:
@@ -420,6 +436,14 @@ async def _r2_mark_content_ready(slug: str, hls_master_key: str) -> None:
 
 async def _r2_mark_content_failed(slug: str) -> None:
     """R2-scan-mode counterpart to `_mark_failed`, for a permanent failure."""
+    if pool is not None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE content SET transcode_status = 'failed', updated_at = now() WHERE slug = $1",
+                slug,
+            )
+        return
+
     dsn = settings.effective_database_url.replace("postgresql+asyncpg://", "postgresql://")
     conn = await asyncpg.connect(dsn, statement_cache_size=0)
     try:
