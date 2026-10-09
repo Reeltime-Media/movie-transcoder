@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from transcode_service.config import settings
-from transcode_service.routers import dashboard, jobs, live
+from transcode_service.routers import dashboard, hls_export, jobs, live
 from transcode_service import live_manager
 from transcode_service import worker as worker_module
 
@@ -55,6 +55,7 @@ app.add_middleware(
 app.include_router(jobs.router)
 app.include_router(dashboard.router)
 app.include_router(live.router)
+app.include_router(hls_export.router)
 
 class LiveHLSStaticFiles(StaticFiles):
     """Custom static file server for live HLS streams.
