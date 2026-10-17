@@ -2,7 +2,8 @@
 expects exactly:
 
   POST /channels/{channel_id}/start  {"source_url": "..."}
-      -> {"status": "starting"|"live", "hls_url": "https://.../index.m3u8"}
+      -> {"status": "starting"|"live"|"error", "hls_url": "https://.../index.m3u8",
+          "error": str|None}
   POST /channels/{channel_id}/stop
       -> {"status": "offline"}
   GET  /channels/{channel_id}/status

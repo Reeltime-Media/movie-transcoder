@@ -231,9 +231,10 @@ async def _watch_for_playlist(
     while elapsed < _PLAYLIST_WAIT_TIMEOUT:
         content = _playlist_text(playlist)
         if "#EXTINF:" in content and content != stale_fingerprint:
-            if channel.status == "starting":
+            if channel.status in ("starting", "error"):
                 channel.status = "live"
             # Recovered — allow a fresh burst of retries if ffmpeg dies later.
+            channel.error = None
             channel.restarts = 0
             return
         await asyncio.sleep(_PLAYLIST_POLL_INTERVAL)
@@ -254,10 +255,9 @@ async def _respawn_channel(channel_id: str) -> None:
 
     stale = _playlist_text(channel.out_dir / "index.m3u8") or None
     prepare_output_dir(channel.out_dir, wipe=False)
-    # Keep serving the last playlist while ffmpeg comes back.
-    if not stale:
-        channel.status = "starting"
-    channel.error = None
+    # Keep serving the last playlist while ffmpeg comes back. Status and error
+    # stay as they are until _watch_for_playlist sees fresh output, so a source
+    # that never connects keeps reporting "error" with ffmpeg's log.
     channel.process = await _spawn_ffmpeg(
         channel_id, channel.source_url, channel.out_dir
     )
@@ -288,6 +288,10 @@ async def _monitor(channel_id: str) -> None:
         return
 
     channel.error = "\n".join(channel.log_lines) or "ffmpeg exited unexpectedly"
+    # Never produced a playlist: report the failure instead of sitting in
+    # "starting". A channel that was live keeps serving its last playlist.
+    if channel.status == "starting":
+        channel.status = "error"
     print(f"[live] ffmpeg exited for {channel_id}: {channel.error[-400:]}")
     await _respawn_channel(channel_id)
 
@@ -296,7 +300,7 @@ async def start_channel(channel_id: str, source_url: str) -> dict:
     existing = _channels.get(channel_id)
     if existing and existing.process.returncode is None:
         if existing.source_url == source_url:
-            return {"status": existing.status, "hls_url": existing.hls_url}
+            return {"status": existing.status, "hls_url": existing.hls_url, "error": existing.error}
         await stop_channel(channel_id)
     elif existing:
         # Process already exited; stop the old monitor from respawning into us.
@@ -314,7 +318,7 @@ async def start_channel(channel_id: str, source_url: str) -> dict:
     _channels[channel_id] = channel
     channel.monitor_task = asyncio.create_task(_monitor(channel_id))
     await _watch_for_playlist(channel)
-    return {"status": channel.status, "hls_url": hls_url}
+    return {"status": channel.status, "hls_url": hls_url, "error": channel.error}
 
 
 async def stop_channel(channel_id: str) -> dict:

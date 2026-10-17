@@ -15,6 +15,9 @@ MACHINE_TYPE="e2-medium"
 REPO_URL="https://github.com/Reeltime-Media/movie-transcoder.git"
 ENV_FILE="$SCRIPT_DIR/.env"
 PORT=8001
+# Public HTTPS base for live HLS (Caddy on the VM forwards /live/* to $PORT).
+# The local .env points WORKER_PUBLIC_URL at localhost for dev; never ship that.
+PUBLIC_URL="https://live.reeltime.fun"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "ERROR: $ENV_FILE not found." >&2
@@ -73,6 +76,13 @@ done
 
 echo "==> Copying .env to the VM"
 gcloud compute scp "$ENV_FILE" "$INSTANCE_NAME:~/transcoder.env" --zone="$ZONE" --quiet
+# The local .env may not end with a newline; add one before appending, or the
+# new line gets glued onto the last setting.
+gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --quiet --command="
+  sed -i '/^WORKER_PUBLIC_URL=/d' ~/transcoder.env &&
+  { [ -z \"\$(tail -c1 ~/transcoder.env)\" ] || echo >> ~/transcoder.env; } &&
+  echo 'WORKER_PUBLIC_URL=$PUBLIC_URL' >> ~/transcoder.env
+"
 
 echo "==> Kicking off install/build/run on the VM in the background"
 gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --quiet --command="
