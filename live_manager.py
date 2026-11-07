@@ -13,6 +13,7 @@ chunk. Set LIVE_COPY=true to remux (-c copy) if the live VM is CPU-bound.
 
 import asyncio
 import shutil
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,10 @@ from transcode_service.config import settings
 _PLAYLIST_POLL_INTERVAL = 0.5
 _PLAYLIST_WAIT_TIMEOUT = 20  # seconds a channel can sit in "starting" before we give up watching
 _STOP_GRACE_SECONDS = 10  # time to let ffmpeg exit after SIGTERM before SIGKILL
+# An ffmpeg that stayed up this long was healthy, so its next failure is retried
+# at once. One that dies sooner keeps backing off, even if its old playlist is
+# still on disk (a dead source never writes a new one).
+_STABLE_SECONDS = 30.0
 _BUNDLED_LOGO = Path(__file__).resolve().parent / "assets" / "reeltime_live_logo.png"
 
 
@@ -47,6 +52,9 @@ class _LiveChannel:
     error: str | None = None
     stopping: bool = False
     restarts: int = 0
+    # Playlist left on disk by the previous ffmpeg; only a different one counts
+    # as fresh output after a crash-restart.
+    stale_fingerprint: str | None = None
     log_lines: deque = field(default_factory=lambda: deque(maxlen=40))
     monitor_task: "asyncio.Task | None" = None
 
@@ -142,6 +150,7 @@ def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
         return [
             settings.ffmpeg_path,
             "-y",
+            "-hide_banner",
             *input_args,
             "-c", "copy",
             *hls_args,
@@ -177,6 +186,7 @@ def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
         return [
             settings.ffmpeg_path,
             "-y",
+            "-hide_banner",
             "-threads", str(max(1, int(settings.live_encode_threads))),
             *input_args,
             "-vf", vf,
@@ -192,6 +202,7 @@ def _build_cmd(source_url: str, out_dir: Path, channel_id: str) -> list[str]:
     return [
         settings.ffmpeg_path,
         "-y",
+        "-hide_banner",
         "-threads", str(max(1, int(settings.live_encode_threads))),
         *input_args,
         "-i", str(logo),
@@ -233,9 +244,7 @@ async def _watch_for_playlist(
         if "#EXTINF:" in content and content != stale_fingerprint:
             if channel.status in ("starting", "error"):
                 channel.status = "live"
-            # Recovered — allow a fresh burst of retries if ffmpeg dies later.
             channel.error = None
-            channel.restarts = 0
             return
         await asyncio.sleep(_PLAYLIST_POLL_INTERVAL)
         elapsed += _PLAYLIST_POLL_INTERVAL
@@ -253,7 +262,7 @@ async def _respawn_channel(channel_id: str) -> None:
     if _channels.get(channel_id) is not channel or channel.stopping:
         return
 
-    stale = _playlist_text(channel.out_dir / "index.m3u8") or None
+    channel.stale_fingerprint = _playlist_text(channel.out_dir / "index.m3u8") or None
     prepare_output_dir(channel.out_dir, wipe=False)
     # Keep serving the last playlist while ffmpeg comes back. Status and error
     # stay as they are until _watch_for_playlist sees fresh output, so a source
@@ -262,13 +271,15 @@ async def _respawn_channel(channel_id: str) -> None:
         channel_id, channel.source_url, channel.out_dir
     )
     channel.monitor_task = asyncio.create_task(_monitor(channel_id))
-    await _watch_for_playlist(channel, stale_fingerprint=stale)
 
 
 async def _monitor(channel_id: str) -> None:
     """Drain ffmpeg's stderr for diagnostics and detect when it exits."""
     channel = _channels[channel_id]
-    watchdog = asyncio.create_task(_watch_for_playlist(channel))
+    started = time.monotonic()
+    watchdog = asyncio.create_task(
+        _watch_for_playlist(channel, stale_fingerprint=channel.stale_fingerprint)
+    )
     proc = channel.process
     assert proc.stderr is not None
     async for raw in proc.stderr:
@@ -277,6 +288,9 @@ async def _monitor(channel_id: str) -> None:
             channel.log_lines.append(line)
     watchdog.cancel()
     await proc.wait()
+    if time.monotonic() - started >= _STABLE_SECONDS:
+        # It was healthy: allow a fresh burst of quick retries.
+        channel.restarts = 0
 
     if channel.stopping:
         channel.status = "offline"

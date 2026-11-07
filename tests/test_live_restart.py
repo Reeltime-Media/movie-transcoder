@@ -110,6 +110,81 @@ def test_source_that_never_connects_reports_error(tmp_path: Path, monkeypatch):
     assert "Connection timed out" in (channel.error or "")
 
 
+def _run_respawn_chain(tmp_path: Path, monkeypatch, cycles: int) -> list[int]:
+    """Let a source that dies instantly (HTTP 404) be respawned `cycles` times.
+
+    Returns the restart counts the backoff was asked about, in order.
+    """
+    (tmp_path / "index.m3u8").write_text("#EXTM3U\n#EXTINF:2.0,\nseg_00001.ts\n")
+    asked: list[int] = []
+
+    def record_delay(restart_count: int) -> float:
+        asked.append(restart_count)
+        return 0.0
+
+    monkeypatch.setattr(live_manager, "ffmpeg_restart_delay_seconds", record_delay)
+    dying = ["sh", "-c", "echo 'Server returned 404 Not Found' >&2; exit 1"]
+    spawned = 0
+
+    async def fake_spawn(channel_id, source_url, out_dir):
+        nonlocal spawned
+        spawned += 1
+        if spawned >= cycles:
+            live_manager._channels[channel_id].stopping = True
+        return await asyncio.create_subprocess_exec(*dying, stderr=asyncio.subprocess.PIPE)
+
+    monkeypatch.setattr(live_manager, "_spawn_ffmpeg", fake_spawn)
+
+    async def run() -> None:
+        proc = await asyncio.create_subprocess_exec(*dying, stderr=asyncio.subprocess.PIPE)
+        channel = _channel(tmp_path, proc, "live")
+        live_manager._channels["cid"] = channel
+        try:
+            await live_manager._monitor("cid")
+            while spawned < cycles or not channel.monitor_task.done():
+                await asyncio.sleep(0.01)
+        finally:
+            live_manager._channels.pop("cid", None)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    return asked
+
+
+def test_dead_source_keeps_backing_off_despite_stale_playlist(tmp_path: Path, monkeypatch):
+    """The playlist left on disk by the last good run must not look like a recovery.
+
+    Before the fix every respawn saw that old playlist, reset the counter and
+    retried after 1s forever: four dead channels cost ~1.8 ffmpeg launches/s.
+    """
+    asked = _run_respawn_chain(tmp_path, monkeypatch, cycles=5)
+    assert asked == [0, 1, 2, 3, 4]
+
+
+def test_ffmpeg_that_ran_stably_restarts_fast_again(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(live_manager, "_STABLE_SECONDS", 0.0)
+    asked = _run_respawn_chain(tmp_path, monkeypatch, cycles=4)
+    assert asked == [0, 0, 0, 0]
+
+
+def test_stale_playlist_is_not_treated_as_fresh_output(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(live_manager, "_PLAYLIST_WAIT_TIMEOUT", 0.2)
+    stale = "#EXTM3U\n#EXTINF:2.0,\nseg_00001.ts\n"
+    (tmp_path / "index.m3u8").write_text(stale)
+    channel = _channel(tmp_path, process=None, status="error")
+    channel.error = "Server returned 404 Not Found"
+    channel.restarts = 3
+
+    asyncio.run(live_manager._watch_for_playlist(channel, stale_fingerprint=stale))
+    assert channel.status == "error"
+    assert channel.error == "Server returned 404 Not Found"
+    assert channel.restarts == 3
+
+
+def test_ffmpeg_cmd_hides_the_version_banner():
+    """The banner made every failed launch write ~12 lines to the container log."""
+    assert "-hide_banner" in _http_cmd()
+
+
 def test_fresh_output_recovers_an_errored_channel(tmp_path: Path):
     (tmp_path / "index.m3u8").write_text("#EXTM3U\n#EXTINF:2.0,\nseg_00001.ts\n")
     channel = _channel(tmp_path, process=None, status="error")
